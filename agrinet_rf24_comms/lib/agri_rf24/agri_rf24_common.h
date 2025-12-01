@@ -172,22 +172,20 @@ struct AgriClusterSchedule {
 // ADDRESS HELPERS
 // =============================
 
-/**
- * Master address: "HQ000" (per README).
- * address[0..4] are the 5 RF24 bytes, address[5] is NUL for printing.
- */
+// =============================
+// ADDRESS HELPERS
+// =============================
+
+// Get master address ("HQ000")
 void agri_getMasterAddress(uint8_t address[6]);
 
-/**
- * Cluster address: "HQA01".."HQA16" style.
- * address[0..4] are the 5 RF24 bytes, address[5] is NUL for printing.
- */
+// Get cluster address (e.g., "HQA01".."HQA16")
 void agri_getClusterAddress(uint8_t clusterId, uint8_t address[6]);
 
-/**
- * UNO node address: "N1A01" etc, derived from clusterId + nodeLocalId.
- */
-void agri_getUnoNodeAddress(uint8_t clusterId, uint8_t nodeLocalId, uint8_t address[6]);
+// Get UNO node address (e.g. "N1A02", "NAA05" for cluster 10, node 5)
+void agri_getUnoNodeAddress(uint8_t clusterId,
+                            uint8_t nodeLocalId,
+                            uint8_t address[6]);
 
 // =============================
 // INIT + SEND/RECV API
