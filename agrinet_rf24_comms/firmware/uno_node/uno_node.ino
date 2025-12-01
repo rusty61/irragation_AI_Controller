@@ -80,6 +80,7 @@ void openActuator();
 void closeActuator();
 void requestOpenActuator();
 void requestCloseActuator();
+bool isActuatorRunning();
 uint16_t readCurrentmA();
 uint8_t  readSoilPct();
 uint16_t readBattmV();
@@ -340,12 +341,17 @@ void closeActuator() {
   Serial.println(F("[UNO_NODE] Actuator CLOSING"));
 }
 
+// Helper to check if actuator is actively running
+bool isActuatorRunning() {
+  return g_currentAction != static_cast<uint8_t>(AgriActAction::ACT_STOP);
+}
+
 // -----------------------------
 // SAFETY CHECKS
 // -----------------------------
 
 void updateActuatorState() {
-  if (g_currentAction == static_cast<uint8_t>(AgriActAction::ACT_STOP)) {
+  if (!isActuatorRunning()) {
     return;
   }
 
@@ -377,16 +383,17 @@ void checkSafetyConditions() {
     g_statusFlags &= ~STATUS_FLAG_COMMS_OK;
     
     // Auto-close valve on comms loss for safety (non-blocking)
-    if (g_currentAction != static_cast<uint8_t>(AgriActAction::ACT_STOP) &&
-        g_actuatorState != ActuatorState::FAILSAFE_CLOSING) {
+    // Only trigger failsafe if actuator is running and not already in failsafe
+    if (isActuatorRunning() && g_actuatorState != ActuatorState::FAILSAFE_CLOSING) {
       Serial.println(F("[UNO_NODE] COMMS TIMEOUT - failsafe close"));
       closeActuator();
       g_actuatorState = ActuatorState::FAILSAFE_CLOSING;
       g_stateStartMs = millis();
     }
     
-    // Reset comms timer to avoid repeated failsafe actions
-    g_lastCommMs = now;
+    // Note: Do NOT reset g_lastCommMs here - it will be reset when actual
+    // communication is received in handleIncomingPackets(). This ensures
+    // the failsafe stays active during true communication loss.
   }
 }
 
