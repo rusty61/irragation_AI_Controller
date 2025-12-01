@@ -14,8 +14,12 @@
 
 static uint16_t g_seqCounter = 1;
 
-static void agri_getUnoQAddress(uint8_t address[6]) {
-  // "HQ000"
+// =============================
+// ADDRESS HELPERS
+// =============================
+
+void agri_getMasterAddress(uint8_t address[6]) {
+  // "HQ000" - master base address
   address[0] = 'H';
   address[1] = 'Q';
   address[2] = '0';
@@ -24,9 +28,10 @@ static void agri_getUnoQAddress(uint8_t address[6]) {
   address[5] = '\0';
 }
 
-// =============================
-// ADDRESS HELPERS
-// =============================
+static void agri_getUnoQAddress(uint8_t address[6]) {
+  // Alias for internal use
+  agri_getMasterAddress(address);
+}
 
 void agri_getClusterAddress(uint8_t clusterId, uint8_t address[6]) {
   // "HQA01".."HQA16"
