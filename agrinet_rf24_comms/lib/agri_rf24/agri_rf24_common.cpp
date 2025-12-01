@@ -8,6 +8,21 @@
   #define DBG_PRINTLN(x)  do {} while (0)
 #endif
 
+
+// Map clusterId 1..16 to the character used in addresses:
+//  1..9   -> '1'..'9'
+// 10..16  -> 'A'..'G'
+// Anything outside 1..16 returns 'X' as a debug marker.
+static char agri_cluster_char(uint8_t clusterId) {
+    if (clusterId >= 1 && clusterId <= 9) {
+        return static_cast<char>('0' + clusterId);
+    }
+    if (clusterId >= 10 && clusterId <= 16) {
+        return static_cast<char>('A' + (clusterId - 10)); // 10->'A', 11->'B', ... 16->'G'
+    }
+    return 'X';
+}
+
 // =============================
 // INTERNAL STATE
 // =============================
@@ -34,30 +49,54 @@ static void agri_getUnoQAddress(uint8_t address[6]) {
 }
 
 void agri_getClusterAddress(uint8_t clusterId, uint8_t address[6]) {
-  // "HQA01".."HQA16"
-  uint8_t tens = (clusterId / 10) % 10;
-  uint8_t ones = clusterId % 10;
+    // Global Tier (UNO_Q ↔ ESP32)
+    //
+    // README examples:
+    //   Cluster 1  -> "HQA01"
+    //   Cluster 2  -> "HQA02"
+    //   ...
+    //   Cluster 16 -> "HQA16"
+    //
+    // Pattern: "HQA" + 2-digit decimal clusterId (zero-padded)
 
-  address[0] = 'H';
-  address[1] = 'Q';
-  address[2] = 'A';
-  address[3] = '0' + tens;
-  address[4] = '0' + ones;
-  address[5] = '\0';
+    uint8_t tens = (clusterId / 10) % 10;    // 0..1 for 1..16
+    uint8_t ones = clusterId % 10;          // 0..9
+
+    address[0] = 'H';
+    address[1] = 'Q';
+    address[2] = 'A';
+    address[3] = static_cast<uint8_t>('0' + tens);
+    address[4] = static_cast<uint8_t>('0' + ones);
+    address[5] = '\0';
 }
 
-void agri_getUnoNodeAddress(uint8_t clusterId, uint8_t nodeLocalId, uint8_t address[6]) {
-  // "N1A01" style: N [clusterId digit] A [tens] [ones]
-  uint8_t tens = (nodeLocalId / 10) % 10;
-  uint8_t ones = nodeLocalId % 10;
 
-  address[0] = 'N';
-  address[1] = '0' + (clusterId % 10);
-  address[2] = 'A';
-  address[3] = '0' + tens;
-  address[4] = '0' + ones;
-  address[5] = '\0';
+void agri_getUnoNodeAddress(uint8_t clusterId,
+                            uint8_t nodeLocalId,
+                            uint8_t address[6]) {
+    // Local Tier (ESP32 ↔ UNO)
+    //
+    // README examples:
+    //   Cluster 1, Node 1  -> "N1A01"
+    //   Cluster 1, Node 2  -> "N1A02"
+    //   Cluster 2, Node 1  -> "N2A01"
+    //   Cluster 10, Node 5 -> "NAA05"  (cluster 10 -> 'A', node 5 -> "05")
+    //
+    // Pattern: 'N' + clusterChar + 'A' + 2-digit decimal nodeLocalId
+
+    char clusterChar = agri_cluster_char(clusterId);
+
+    uint8_t nodeTens = (nodeLocalId / 10) % 10;   // 0..9
+    uint8_t nodeOnes = nodeLocalId % 10;          // 0..9
+
+    address[0] = 'N';
+    address[1] = static_cast<uint8_t>(clusterChar);
+    address[2] = 'A';
+    address[3] = static_cast<uint8_t>('0' + nodeTens);
+    address[4] = static_cast<uint8_t>('0' + nodeOnes);
+    address[5] = '\0';
 }
+
 
 // =============================
 // HEADER BUILDING
