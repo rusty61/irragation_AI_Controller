@@ -4,10 +4,11 @@
 
 // -----------------------------
 // HW CONFIG - ADJUST
+// RF24 pins for Arduino UNO_Q (per README)
 // -----------------------------
 
-static const uint8_t PIN_RF24_CE  = 7;
-static const uint8_t PIN_RF24_CSN = 8;
+static const uint8_t PIN_RF24_CE  = 9;
+static const uint8_t PIN_RF24_CSN = 10;
 
 RF24 radio(PIN_RF24_CE, PIN_RF24_CSN);
 

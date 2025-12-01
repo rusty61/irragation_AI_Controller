@@ -5,9 +5,10 @@
 
 // -----------------------------
 // HW CONFIG - ADJUST
+// RF24 pins for ESP32 (per README)
 // -----------------------------
 
-static const uint8_t PIN_RF24_CE  = 22;
+static const uint8_t PIN_RF24_CE  = 4;
 static const uint8_t PIN_RF24_CSN = 5;
 
 static const uint8_t CLUSTER_ID = 1;
@@ -102,9 +103,8 @@ void loop() {
 
 void sendClusterTelemetry() {
   uint8_t destAddr[6];
-  // UNO_Q as global master
-  // for now, UNO_Q address is hardcoded helper
-  agri_getClusterAddress(0, destAddr); // or define a dedicated helper if you prefer
+  // UNO_Q master address is "HQ000"
+  agri_getMasterAddress(destAddr);
 
   struct __attribute__((packed)) {
     AgriPacketHeader     hdr;
