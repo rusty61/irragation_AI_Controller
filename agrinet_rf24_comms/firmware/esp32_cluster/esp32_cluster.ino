@@ -213,9 +213,11 @@ void readSensors()
     int rawPanel = analogRead(PIN_PANEL_VOLTAGE);
     panelVoltage_mV = rawPanel * 3300 / 4095 * 6; // 6:1 divider for 18V
     
-    // Read pump current
+    // Read pump current (assuming ACS712 or similar current sensor)
+    // Center point is 2048 (1.65V at 3.3V reference for 12-bit ADC)
+    // Adjust scaling factor based on sensor sensitivity
     int rawCurrent = analogRead(PIN_PUMP_CURRENT);
-    pumpCurrent_mA = abs(rawCurrent - 2048) * 2; // Simplified conversion
+    pumpCurrent_mA = (uint16_t)(abs(rawCurrent - 2048) * 8); // ~8mA per ADC step (adjust for sensor)
 }
 
 /*============================================================================
@@ -383,13 +385,16 @@ void pingNode(uint8_t nodeId)
 
 /**
  * @brief Poll all nodes for status
+ * @note Brief delay between pings allows RF24 auto-retry to complete
+ *       and prevents channel congestion. This function is called
+ *       infrequently (every NODE_POLL_INTERVAL_MS) so impact is minimal.
  */
 void pollAllNodes()
 {
     for (uint8_t i = 0; i < numNodes; i++) {
         if (nodes[i].nodeId != 0) {
             pingNode(nodes[i].nodeId);
-            delay(50); // Small delay between pings
+            delay(50); // Allow RF24 auto-retry cycle to complete
         }
     }
 }
@@ -496,8 +501,11 @@ void processMasterMessage(const AgriPacket &packet)
         case AgriMsgTypeCluster::CLUSTER_CMD_ZONE: {
             AGRI_DEBUG_PRINTLN(F("[RX<-M] Zone command"));
             // Extract command and forward to appropriate node
+            // Note: In this implementation, zoneLocalId maps directly to nodeId
+            // Modify this mapping if your zone-to-node relationship differs
             const AgriUnoActuatorCommand &cmd = packet.payload.actuatorCmd;
-            sendActuatorCommand(cmd.zoneLocalId, cmd.zoneLocalId,
+            uint8_t targetNodeId = cmd.zoneLocalId; // Assumes 1:1 zone-to-node mapping
+            sendActuatorCommand(targetNodeId, cmd.zoneLocalId,
                                static_cast<AgriActuatorAction>(cmd.action),
                                cmd.runMs);
             break;

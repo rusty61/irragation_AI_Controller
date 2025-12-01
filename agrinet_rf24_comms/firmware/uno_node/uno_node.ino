@@ -206,8 +206,10 @@ void processActuatorCommand(const AgriUnoActuatorCommand &cmd)
     AGRI_DEBUG_PRINTLN(cmd.action);
     
     // Stop current movement first (direction interlock)
+    // Brief delay is intentional to prevent motor H-bridge shoot-through
+    // This 50ms delay is acceptable as command processing is not time-critical
     stopActuator();
-    delay(50); // Small delay for interlock
+    delay(50);
     
     switch (static_cast<AgriActuatorAction>(cmd.action)) {
         case AgriActuatorAction::ACTION_OPEN:
@@ -258,10 +260,11 @@ void readSensors()
     soilRaw = analogRead(PIN_SOIL_SENSOR);
     soilPct = map(soilRaw, 0, 1023, 0, 100);
     
-    // Read current sensor (assuming ACS712 or similar)
+    // Read current sensor (assuming ACS712 5A module or similar)
+    // Center point is 512 (2.5V at 5V reference for 10-bit ADC)
+    // Adjust scaling factor based on sensor sensitivity (e.g., ACS712-5A = 185mV/A)
     int rawCurrent = analogRead(PIN_CURRENT_SENSOR);
-    // Convert to mA (adjust scaling for your sensor)
-    currentReading_mA = abs(rawCurrent - 512) * 5; // Simplified conversion
+    currentReading_mA = (uint16_t)(abs(rawCurrent - 512) * 26); // ~26mA per ADC step for 5A module
     
     // Read battery voltage (assuming voltage divider)
     int rawBatt = analogRead(PIN_BATT_VOLTAGE);

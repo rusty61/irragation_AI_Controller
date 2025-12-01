@@ -211,13 +211,16 @@ void pingCluster(uint8_t clusterId)
 
 /**
  * @brief Poll all clusters
+ * @note Brief delay between pings allows RF24 auto-retry cycle to complete
+ *       and prevents channel congestion. This function is called
+ *       infrequently (every CLUSTER_POLL_INTERVAL_MS) so impact is minimal.
  */
 void pollAllClusters()
 {
     for (uint8_t i = 0; i < numClusters; i++) {
         if (clusters[i].clusterId != 0) {
             pingCluster(clusters[i].clusterId);
-            delay(100); // Delay between pings
+            delay(100); // Allow RF24 auto-retry cycle to complete
         }
     }
 }
@@ -254,13 +257,15 @@ void sendScheduleToCluster(uint8_t clusterId, const AgriClusterSchedule &schedul
 
 /**
  * @brief Broadcast schedules to all clusters
+ * @note Brief delay between transmissions allows RF24 auto-retry cycle
+ *       to complete. Called infrequently (every SCHEDULE_BROADCAST_INTERVAL_MS).
  */
 void broadcastSchedules()
 {
     for (uint8_t i = 0; i < numClusters; i++) {
         if (clusters[i].clusterId != 0 && clusters[i].online) {
             sendScheduleToCluster(clusters[i].clusterId, masterSchedules[i]);
-            delay(100);
+            delay(100); // Allow RF24 auto-retry cycle to complete
         }
     }
 }

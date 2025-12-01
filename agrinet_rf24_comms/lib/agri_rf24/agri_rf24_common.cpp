@@ -56,7 +56,7 @@ void agri_getUnoNodeAddress(uint8_t clusterId, uint8_t nodeLocalId, uint8_t addr
     if (nodeLocalId < 1) nodeLocalId = 1;
     if (nodeLocalId > AGRI_MAX_NODES_PER_CLUSTER) nodeLocalId = AGRI_MAX_NODES_PER_CLUSTER;
     
-    // For clusters > 9, use hex digit (A-F for 10-15, G for 16)
+    // For clusters > 9, use hex digit (A-G for 10-16)
     char clusterChar;
     if (clusterId <= 9) {
         clusterChar = '0' + clusterId;
