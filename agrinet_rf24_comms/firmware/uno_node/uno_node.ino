@@ -13,7 +13,7 @@
  *  - RF24 client at the bottom tier
  *  - Receives UNO_CMD_ACTUATOR from ESP32 cluster
  *  - Drives a single actuator (open/close) with safety:
- *      * max runtime
+ *      * per-command runMs with MAX_RUNTIME cap
  *      * non-blocking direction interlock
  *      * comms timeout -> failsafe close
  *      * overcurrent cutoff
@@ -44,7 +44,7 @@ static const uint8_t ZONE_LOCAL_ID = 1;   // zone ID (usually same as node)
 // SAFETY CONSTANTS
 // -----------------------------
 
-static const uint32_t MAX_RUNTIME_MS        = 30000UL;   // 30 s
+static const uint32_t MAX_RUNTIME_MS        = 30000UL;   // absolute cap (30 s)
 static const uint32_t DIRECTION_DELAY_MS    = 100UL;     // between reverse moves
 static const uint32_t COMMS_TIMEOUT_MS      = 60000UL;   // 60 s
 static const uint16_t OVERCURRENT_THRESHOLD = 2000;      // mA (adjust to real sensor)
@@ -62,10 +62,13 @@ RF24 radio(PIN_RF24_CE, PIN_RF24_CSN);
 // -----------------------------
 
 // Actuator action is encoded as AgriActAction (0=STOP,1=OPEN,2=CLOSE)
-static uint8_t  g_currentAction   = static_cast<uint8_t>(AgriActAction::ACT_STOP);
-static uint8_t  g_pendingAction   = static_cast<uint8_t>(AgriActAction::ACT_STOP);
-static uint32_t g_actuatorStartMs = 0;
+static uint8_t  g_currentAction    = static_cast<uint8_t>(AgriActAction::ACT_STOP);
+static uint8_t  g_pendingAction    = static_cast<uint8_t>(AgriActAction::ACT_STOP);
+static uint32_t g_actuatorStartMs  = 0;
 static uint32_t g_interlockUntilMs = 0;
+
+// Target runtime for the *current command* (bounded by MAX_RUNTIME_MS)
+static uint32_t g_targetRunMs      = MAX_RUNTIME_MS;
 
 static uint32_t g_lastStatusMs = 0;
 static uint32_t g_lastCommMs   = 0;
@@ -234,6 +237,21 @@ void processActuatorCommand(const AgriUnoActuatorCommand &cmd) {
     return;
   }
 
+  // Honour runMs, but cap it for safety.
+  //  - 0   => default full stroke (MAX_RUNTIME_MS)
+  //  - >0  => min(requested, MAX_RUNTIME_MS)
+  uint32_t requested = cmd.runMs;
+  if (requested == 0) {
+    g_targetRunMs = MAX_RUNTIME_MS;
+  } else if (requested > MAX_RUNTIME_MS) {
+    g_targetRunMs = MAX_RUNTIME_MS;
+  } else {
+    g_targetRunMs = requested;
+  }
+
+  // New command clears timeout/overcurrent/fault (we’re giving it another go)
+  g_statusFlags &= ~(STATUS_FLAG_TIMEOUT | STATUS_FLAG_OVERCURR | STATUS_FLAG_FAULT);
+
   requestActuatorAction(action);
 }
 
@@ -247,7 +265,8 @@ void requestActuatorAction(uint8_t newAction) {
   uint8_t closeA = static_cast<uint8_t>(AgriActAction::ACT_CLOSE);
 
   if (newAction == stop) {
-    // Immediate stop
+    // Immediate stop; we *do not* change OPEN/CLOSED flags here,
+    // we leave them as last known position.
     applyActuatorOutputs(stop);
     g_currentAction    = stop;
     g_pendingAction    = stop;
@@ -298,7 +317,9 @@ void applyActuatorOutputs(uint8_t action) {
 
 void updateActuatorState() {
   uint32_t now = millis();
-  uint8_t stop = static_cast<uint8_t>(AgriActAction::ACT_STOP);
+  uint8_t stop   = static_cast<uint8_t>(AgriActAction::ACT_STOP);
+  uint8_t openA  = static_cast<uint8_t>(AgriActAction::ACT_OPEN);
+  uint8_t closeA = static_cast<uint8_t>(AgriActAction::ACT_CLOSE);
 
   // Handle pending actions after interlock
   if (g_pendingAction != stop && now >= g_interlockUntilMs && g_currentAction == stop) {
@@ -307,27 +328,55 @@ void updateActuatorState() {
     g_pendingAction    = stop;
     g_actuatorStartMs  = now;
     g_statusFlags |= STATUS_FLAG_MOVING;
-    g_statusFlags &= ~(STATUS_FLAG_OPEN | STATUS_FLAG_CLOSED);
+    // We are actively moving, so don't claim open/closed yet
+    g_statusFlags &= ~(STATUS_FLAG_OPEN | STATUS_FLAG_CLOSED | STATUS_FLAG_TIMEOUT);
     applyActuatorOutputs(g_currentAction);
   }
 
-  // If we’re moving, enforce max runtime + overcurrent here
+  // If we’re moving, enforce per-command runtime + max runtime + overcurrent
   if (g_currentAction != stop) {
-    if (now - g_actuatorStartMs >= MAX_RUNTIME_MS) {
-      Serial.println(F("[UNO_NODE] MAX_RUNTIME reached -> STOP"));
-      g_statusFlags |= STATUS_FLAG_TIMEOUT;
-      g_statusFlags &= ~STATUS_FLAG_MOVING;
+    uint32_t elapsed = now - g_actuatorStartMs;
+
+    // 1) Normal completion: runMs reached (without hitting safety limits)
+    if (elapsed >= g_targetRunMs) {
+      Serial.println(F("[UNO_NODE] Command runMs reached -> STOP (normal completion)"));
+
+      // Normal completion: no TIMEOUT/FAULT, just set final position.
+      g_statusFlags &= ~(STATUS_FLAG_MOVING | STATUS_FLAG_TIMEOUT | STATUS_FLAG_FAULT);
+
+      // Approximate final position based on direction.
+      g_statusFlags &= ~(STATUS_FLAG_OPEN | STATUS_FLAG_CLOSED);
+      if (g_currentAction == openA) {
+        g_statusFlags |= STATUS_FLAG_OPEN | STATUS_FLAG_ENDSTOP;
+      } else if (g_currentAction == closeA) {
+        g_statusFlags |= STATUS_FLAG_CLOSED | STATUS_FLAG_ENDSTOP;
+      }
+
       applyActuatorOutputs(stop);
       g_currentAction    = stop;
       g_actuatorStartMs  = 0;
       return;
     }
 
+    // 2) Hard safety cap (absolute MAX_RUNTIME ceiling)
+    if (elapsed >= MAX_RUNTIME_MS) {
+      Serial.println(F("[UNO_NODE] MAX_RUNTIME reached -> STOP (timeout)"));
+      g_statusFlags |= STATUS_FLAG_TIMEOUT;
+      g_statusFlags &= ~STATUS_FLAG_MOVING;
+      // We do NOT change OPEN/CLOSED here – final position is unknown
+      applyActuatorOutputs(stop);
+      g_currentAction    = stop;
+      g_actuatorStartMs  = 0;
+      return;
+    }
+
+    // 3) Overcurrent protection
     uint16_t currentmA = readCurrentmA();
     if (currentmA > OVERCURRENT_THRESHOLD) {
       Serial.println(F("[UNO_NODE] OVERCURRENT -> STOP + FAULT"));
       g_statusFlags |= STATUS_FLAG_OVERCURR | STATUS_FLAG_FAULT;
       g_statusFlags &= ~STATUS_FLAG_MOVING;
+      // OPEN/CLOSED left as-is; we don't know if it reached an endstop
       applyActuatorOutputs(stop);
       g_currentAction    = stop;
       g_actuatorStartMs  = 0;
@@ -359,13 +408,15 @@ void performCommsTimeoutFailsafe() {
   uint8_t closeA = static_cast<uint8_t>(AgriActAction::ACT_CLOSE);
   uint8_t stop   = static_cast<uint8_t>(AgriActAction::ACT_STOP);
 
-  // If already closing or stopped, just let MAX_RUNTIME cut it off.
+  // For failsafe close we want a full-stroke attempt.
+  g_targetRunMs = MAX_RUNTIME_MS;
+
+  // If already closing or stopped, just let state machine handle it.
   if (g_currentAction == stop && g_pendingAction == stop) {
     // Request a close move; state machine will enforce runtime limit
     requestActuatorAction(closeA);
   } else if (g_currentAction != stop) {
     // Already moving; let runtime cutoff handle it.
-    // Still set timeout flag.
   }
 
   g_statusFlags |= STATUS_FLAG_TIMEOUT;
@@ -377,9 +428,9 @@ void performCommsTimeoutFailsafe() {
 
 uint16_t readCurrentmA() {
   int raw = analogRead(PIN_CURRENT_SENSE);
-  // TODO: calibrate properly; placeholder 5 mA/ADC step
   if (raw < 0) raw = 0;
   if (raw > 1023) raw = 1023;
+  // TODO: calibrate properly; placeholder 5 mA/ADC step
   return static_cast<uint16_t>(raw * 5);
 }
 
@@ -445,6 +496,3 @@ void sendUnoStatus() {
     Serial.println(F("[UNO_NODE] sent status"));
   }
 }
-
-
-
