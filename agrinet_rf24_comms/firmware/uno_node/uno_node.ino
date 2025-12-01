@@ -56,6 +56,16 @@ uint16_t g_lastCmdSeq           = 0;
 uint16_t g_statusFlags          = STATUS_FLAG_CLOSED | STATUS_FLAG_COMMS_OK;
 uint8_t  g_currentAction        = 0;  // AgriActAction: 0=STOP, 1=OPEN, 2=CLOSE
 
+// State machine for direction interlock and failsafe
+enum class ActuatorState : uint8_t {
+  IDLE,
+  INTERLOCK_WAIT,    // Waiting for direction change delay
+  FAILSAFE_CLOSING,  // Failsafe close in progress
+};
+ActuatorState g_actuatorState   = ActuatorState::IDLE;
+uint32_t g_stateStartMs         = 0;
+uint8_t  g_pendingAction        = 0;  // Action to execute after interlock
+
 // -----------------------------
 // FORWARD DECLARATIONS
 // -----------------------------
@@ -64,9 +74,12 @@ void handleIncomingPackets();
 void processActuatorCommand(const AgriUnoActuatorCommand &cmd);
 void sendUnoStatus();
 void updateActuatorState();
+void updateStateMachine();
 void stopActuator();
 void openActuator();
 void closeActuator();
+void requestOpenActuator();
+void requestCloseActuator();
 uint16_t readCurrentmA();
 uint8_t  readSoilPct();
 uint16_t readBattmV();
@@ -118,6 +131,9 @@ void loop() {
 
   // Handle incoming packets from ESP32 cluster
   handleIncomingPackets();
+
+  // Update state machine (non-blocking interlocks and failsafe)
+  updateStateMachine();
 
   // Update actuator state and safety checks
   updateActuatorState();
@@ -209,29 +225,82 @@ void processActuatorCommand(const AgriUnoActuatorCommand &cmd) {
   switch (cmd.action) {
     case static_cast<uint8_t>(AgriActAction::ACT_STOP):
       stopActuator();
+      g_actuatorState = ActuatorState::IDLE;
       break;
 
     case static_cast<uint8_t>(AgriActAction::ACT_OPEN):
-      // Direction interlock: if closing, stop first with delay
-      if (g_currentAction == static_cast<uint8_t>(AgriActAction::ACT_CLOSE)) {
-        stopActuator();
-        delay(DIRECTION_DELAY_MS);
-      }
-      openActuator();
+      requestOpenActuator();
       break;
 
     case static_cast<uint8_t>(AgriActAction::ACT_CLOSE):
-      // Direction interlock: if opening, stop first with delay
-      if (g_currentAction == static_cast<uint8_t>(AgriActAction::ACT_OPEN)) {
-        stopActuator();
-        delay(DIRECTION_DELAY_MS);
-      }
-      closeActuator();
+      requestCloseActuator();
       break;
 
     default:
       Serial.println(F("[UNO_NODE] Unknown action"));
       break;
+  }
+}
+
+// -----------------------------
+// NON-BLOCKING STATE MACHINE
+// -----------------------------
+
+void updateStateMachine() {
+  uint32_t now = millis();
+
+  switch (g_actuatorState) {
+    case ActuatorState::INTERLOCK_WAIT:
+      // Wait for direction interlock delay before executing pending action
+      if ((now - g_stateStartMs) >= DIRECTION_DELAY_MS) {
+        if (g_pendingAction == static_cast<uint8_t>(AgriActAction::ACT_OPEN)) {
+          openActuator();
+        } else if (g_pendingAction == static_cast<uint8_t>(AgriActAction::ACT_CLOSE)) {
+          closeActuator();
+        }
+        g_actuatorState = ActuatorState::IDLE;
+      }
+      break;
+
+    case ActuatorState::FAILSAFE_CLOSING:
+      // Failsafe close for a brief period then stop
+      if ((now - g_stateStartMs) >= 1000) {
+        stopActuator();
+        g_actuatorState = ActuatorState::IDLE;
+        Serial.println(F("[UNO_NODE] Failsafe complete"));
+      }
+      break;
+
+    case ActuatorState::IDLE:
+    default:
+      // Nothing to do
+      break;
+  }
+}
+
+void requestOpenActuator() {
+  // Direction interlock: if closing, stop first and wait
+  if (g_currentAction == static_cast<uint8_t>(AgriActAction::ACT_CLOSE)) {
+    stopActuator();
+    g_pendingAction = static_cast<uint8_t>(AgriActAction::ACT_OPEN);
+    g_actuatorState = ActuatorState::INTERLOCK_WAIT;
+    g_stateStartMs = millis();
+    Serial.println(F("[UNO_NODE] Direction interlock - waiting to open"));
+  } else {
+    openActuator();
+  }
+}
+
+void requestCloseActuator() {
+  // Direction interlock: if opening, stop first and wait
+  if (g_currentAction == static_cast<uint8_t>(AgriActAction::ACT_OPEN)) {
+    stopActuator();
+    g_pendingAction = static_cast<uint8_t>(AgriActAction::ACT_CLOSE);
+    g_actuatorState = ActuatorState::INTERLOCK_WAIT;
+    g_stateStartMs = millis();
+    Serial.println(F("[UNO_NODE] Direction interlock - waiting to close"));
+  } else {
+    closeActuator();
   }
 }
 
@@ -303,17 +372,17 @@ void updateActuatorState() {
 void checkSafetyConditions() {
   uint32_t now = millis();
 
-  // Failsafe on communication loss
+  // Failsafe on communication loss (only if not already in failsafe state)
   if ((now - g_lastCommMs) >= COMMS_TIMEOUT_MS) {
     g_statusFlags &= ~STATUS_FLAG_COMMS_OK;
     
-    // Auto-close valve on comms loss for safety
-    if (g_currentAction != static_cast<uint8_t>(AgriActAction::ACT_STOP)) {
+    // Auto-close valve on comms loss for safety (non-blocking)
+    if (g_currentAction != static_cast<uint8_t>(AgriActAction::ACT_STOP) &&
+        g_actuatorState != ActuatorState::FAILSAFE_CLOSING) {
       Serial.println(F("[UNO_NODE] COMMS TIMEOUT - failsafe close"));
       closeActuator();
-      // Let it close briefly then stop
-      delay(1000);
-      stopActuator();
+      g_actuatorState = ActuatorState::FAILSAFE_CLOSING;
+      g_stateStartMs = millis();
     }
     
     // Reset comms timer to avoid repeated failsafe actions
