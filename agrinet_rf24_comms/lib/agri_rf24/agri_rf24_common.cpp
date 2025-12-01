@@ -101,7 +101,8 @@ AgriResult agri_rf24_init_common(
   radio.setCRCLength(RF24_CRC_16);
   radio.setAutoAck(true);
   radio.enableDynamicPayloads();
-  radio.setPALevel(RF24_PA_MAX);
+radio.setPALevel(RF24_PA_HIGH); 
+  radio.setAddressWidth(5);  
 
   uint8_t rxAddr[6];
 
