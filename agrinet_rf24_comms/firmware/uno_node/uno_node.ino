@@ -1,4 +1,4 @@
-// agrinet_rf24_comms/firmware/uno_node/uno_node.ino
+// agrinet_rf24_comms/firmware/uno_node_full/uno_node_full.ino
 
 #include <Arduino.h>
 #include <SPI.h>
@@ -6,25 +6,22 @@
 #include "agri_rf24_common.h"
 
 /**
- * @file uno_node.ino
- * @brief UNO Actuator Node Firmware for AgriNet RF24 Communications
+ * UNO Actuator Node – RF24 + Actuator State Machine
  *
- * Responsibilities:
- *  - RF24 client at the bottom tier
- *  - Receives UNO_CMD_ACTUATOR from ESP32 cluster
- *  - Drives a single actuator (open/close) with safety:
- *      * per-command runMs with MAX_RUNTIME cap
- *      * non-blocking direction interlock
- *      * comms timeout -> failsafe close
- *      * overcurrent cutoff
- *  - Periodically sends UNO_STATUS to its parent ESP32 cluster
+ * - Listens for UNO_CMD_ACTUATOR from ESP32 on pipe "UN001"
+ * - Sends UNO_STATUS periodically to ESP32 on pipe "CL001"
+ * - Drives a single actuator (OPEN/CLOSE) with:
+ *   * per-command runMs (capped by MAX_RUNTIME_MS)
+ *   * direction interlock
+ *   * overcurrent cutoff
+ *   * comms-timeout failsafe -> CLOSE
  */
 
 // -----------------------------
 // HW CONFIG – PER NODE
 // -----------------------------
 
-// RF24 pins on Arduino UNO (per README)
+// RF24 pins on Arduino UNO
 static const uint8_t PIN_RF24_CE  = 9;
 static const uint8_t PIN_RF24_CSN = 10;
 
@@ -39,6 +36,12 @@ static const uint8_t PIN_BATT_SENSE     = A2;
 static const uint8_t MY_CLUSTER_ID = 1;   // which ESP32 cluster we talk to
 static const uint8_t MY_NODE_ID    = 1;   // local node ID within that cluster
 static const uint8_t ZONE_LOCAL_ID = 1;   // zone ID (usually same as node)
+
+// RF24 addresses
+//  - Uplink (UNO -> ESP32) uses "CL001"
+//  - Downlink (ESP32 -> UNO) uses "UN001"
+static const byte ADDR_UP[6]   = "CL001";  // status to ESP32
+static const byte ADDR_DOWN[6] = "UN001";  // commands from ESP32
 
 // -----------------------------
 // SAFETY CONSTANTS
@@ -60,21 +63,24 @@ RF24 radio(PIN_RF24_CE, PIN_RF24_CSN);
 // -----------------------------
 // STATE
 // -----------------------------
-
 // Actuator action is encoded as AgriActAction (0=STOP,1=OPEN,2=CLOSE)
-static uint8_t  g_currentAction    = static_cast<uint8_t>(AgriActAction::ACT_STOP);
-static uint8_t  g_pendingAction    = static_cast<uint8_t>(AgriActAction::ACT_STOP);
+static uint8_t  g_currentAction    = static_cast<uint8_t>(AgriActAction::STOP);
+static uint8_t  g_pendingAction    = static_cast<uint8_t>(AgriActAction::STOP);
+
 static uint32_t g_actuatorStartMs  = 0;
 static uint32_t g_interlockUntilMs = 0;
 
 // Target runtime for the *current command* (bounded by MAX_RUNTIME_MS)
 static uint32_t g_targetRunMs      = MAX_RUNTIME_MS;
 
-static uint32_t g_lastStatusMs = 0;
-static uint32_t g_lastCommMs   = 0;
+static uint32_t g_lastStatusMs     = 0;
+static uint32_t g_lastCommMs       = 0;
 
-static uint16_t g_lastCmdSeq   = 0;
-static uint16_t g_statusFlags  = STATUS_FLAG_CLOSED | STATUS_FLAG_COMMS_OK;
+static uint16_t g_lastCmdSeq       = 0;
+static uint16_t g_statusFlags      = 0;     // we only reliably use MOVING + FAULT
+
+// Outgoing sequence number
+static uint16_t g_seq              = 0;
 
 // -----------------------------
 // FORWARD DECLS
@@ -87,7 +93,6 @@ void requestActuatorAction(uint8_t newAction);
 void applyActuatorOutputs(uint8_t action);
 void updateActuatorState();
 void checkSafetyConditions();
-void performCommsTimeoutFailsafe();
 
 uint16_t readCurrentmA();
 uint8_t  readSoilPct();
@@ -102,7 +107,7 @@ void sendUnoStatus();
 void setup() {
   Serial.begin(115200);
   delay(500);
-  Serial.println(F("\n[UNO_NODE] Booting"));
+  Serial.println(F("\n[UNO_NODE] Booting (FULL RF24 + ACTUATOR)"));
   Serial.print(F("[UNO_NODE] Cluster="));
   Serial.print(MY_CLUSTER_ID);
   Serial.print(F(" Node="));
@@ -113,19 +118,24 @@ void setup() {
   digitalWrite(PIN_ACTUATOR_OPEN, LOW);
   digitalWrite(PIN_ACTUATOR_CLOSE, LOW);
 
-  AgriResult res = agri_rf24_init_common(
-    radio,
-    AgriRole::UNO_NODE,
-    MY_NODE_ID,
-    MY_CLUSTER_ID
-  );
-
-  if (res != AgriResult::OK) {
-    Serial.println(F("[UNO_NODE] RF24 init FAILED"));
-    g_statusFlags |= STATUS_FLAG_FAULT;
+  if (!radio.begin()) {
+    Serial.println(F("[UNO_NODE] RF24 begin FAILED"));
   } else {
-    Serial.println(F("[UNO_NODE] RF24 init OK"));
+    Serial.println(F("[UNO_NODE] RF24 begin OK"));
   }
+
+  // RF24 config – must match ESP32
+  radio.setChannel(76);
+  radio.setPALevel(RF24_PA_LOW);
+  radio.setDataRate(RF24_250KBPS);
+  radio.setRetries(5, 15);
+  radio.enableDynamicPayloads();
+  radio.setAutoAck(true);
+
+  // Uplink + downlink
+  radio.openWritingPipe(ADDR_UP);
+  radio.openReadingPipe(1, ADDR_DOWN);
+  radio.startListening();
 
   uint32_t now = millis();
   g_lastCommMs   = now;
@@ -139,13 +149,13 @@ void setup() {
 void loop() {
   uint32_t now = millis();
 
-  // Handle RF24 RX
+  // Handle RF24 RX (commands from ESP32)
   handleIncomingPackets();
 
   // Drive actuator state machine (non-blocking)
   updateActuatorState();
 
-  // Safety (comms timeout, etc.)
+  // Safety (comms timeout -> failsafe close)
   checkSafetyConditions();
 
   // Periodic status up to cluster
@@ -180,8 +190,8 @@ void handleIncomingPackets() {
       continue;
     }
 
-    g_lastCommMs    = millis();
-    g_statusFlags  |= STATUS_FLAG_COMMS_OK;
+    // Any valid RX counts as comms activity
+    g_lastCommMs = millis();
 
     AgriMsgType msgType = static_cast<AgriMsgType>(hdr->msgType);
 
@@ -200,11 +210,6 @@ void handleIncomingPackets() {
       case AgriMsgType::UNO_PING: {
         Serial.println(F("[UNO_NODE] PING -> sending status"));
         sendUnoStatus();
-        break;
-      }
-
-      case AgriMsgType::UNO_CMD_CONFIG: {
-        Serial.println(F("[UNO_NODE] CONFIG not implemented"));
         break;
       }
 
@@ -232,14 +237,12 @@ void processActuatorCommand(const AgriUnoActuatorCommand &cmd) {
 
   uint8_t action = cmd.action;
 
-  if (action > static_cast<uint8_t>(AgriActAction::ACT_CLOSE)) {
+  if (action > static_cast<uint8_t>(AgriActAction::CLOSE)) {
     Serial.println(F("[UNO_NODE] Unknown action, ignoring"));
     return;
   }
 
   // Honour runMs, but cap it for safety.
-  //  - 0   => default full stroke (MAX_RUNTIME_MS)
-  //  - >0  => min(requested, MAX_RUNTIME_MS)
   uint32_t requested = cmd.runMs;
   if (requested == 0) {
     g_targetRunMs = MAX_RUNTIME_MS;
@@ -249,8 +252,8 @@ void processActuatorCommand(const AgriUnoActuatorCommand &cmd) {
     g_targetRunMs = requested;
   }
 
-  // New command clears timeout/overcurrent/fault (we’re giving it another go)
-  g_statusFlags &= ~(STATUS_FLAG_TIMEOUT | STATUS_FLAG_OVERCURR | STATUS_FLAG_FAULT);
+  // Clear FAULT bit on new command (we’re giving it another go)
+  g_statusFlags &= ~STATUS_FLAG_FAULT;
 
   requestActuatorAction(action);
 }
@@ -260,13 +263,12 @@ void processActuatorCommand(const AgriUnoActuatorCommand &cmd) {
 // -----------------------------
 
 void requestActuatorAction(uint8_t newAction) {
-  uint8_t stop   = static_cast<uint8_t>(AgriActAction::ACT_STOP);
-  uint8_t openA  = static_cast<uint8_t>(AgriActAction::ACT_OPEN);
-  uint8_t closeA = static_cast<uint8_t>(AgriActAction::ACT_CLOSE);
+  uint8_t stop   = static_cast<uint8_t>(AgriActAction::STOP);
+  uint8_t openA  = static_cast<uint8_t>(AgriActAction::OPEN);
+  uint8_t closeA = static_cast<uint8_t>(AgriActAction::CLOSE);
 
   if (newAction == stop) {
-    // Immediate stop; we *do not* change OPEN/CLOSED flags here,
-    // we leave them as last known position.
+    // Immediate stop, keep last position unknown
     applyActuatorOutputs(stop);
     g_currentAction    = stop;
     g_pendingAction    = stop;
@@ -277,7 +279,7 @@ void requestActuatorAction(uint8_t newAction) {
     return;
   }
 
-  // If we’re changing direction, schedule an interlock window
+  // Direction change → brief interlock
   if ((g_currentAction == openA && newAction == closeA) ||
       (g_currentAction == closeA && newAction == openA)) {
 
@@ -290,15 +292,15 @@ void requestActuatorAction(uint8_t newAction) {
     return;
   }
 
-  // Same direction or from STOP -> just go
+  // From STOP or same direction: just schedule
   g_pendingAction    = newAction;
   g_interlockUntilMs = millis();  // allow immediate start in updateActuatorState()
 }
 
 void applyActuatorOutputs(uint8_t action) {
-  uint8_t stop   = static_cast<uint8_t>(AgriActAction::ACT_STOP);
-  uint8_t openA  = static_cast<uint8_t>(AgriActAction::ACT_OPEN);
-  uint8_t closeA = static_cast<uint8_t>(AgriActAction::ACT_CLOSE);
+  uint8_t stop   = static_cast<uint8_t>(AgriActAction::STOP);
+  uint8_t openA  = static_cast<uint8_t>(AgriActAction::OPEN);
+  uint8_t closeA = static_cast<uint8_t>(AgriActAction::CLOSE);
 
   if (action == stop) {
     digitalWrite(PIN_ACTUATOR_OPEN, LOW);
@@ -317,19 +319,18 @@ void applyActuatorOutputs(uint8_t action) {
 
 void updateActuatorState() {
   uint32_t now = millis();
-  uint8_t stop   = static_cast<uint8_t>(AgriActAction::ACT_STOP);
-  uint8_t openA  = static_cast<uint8_t>(AgriActAction::ACT_OPEN);
-  uint8_t closeA = static_cast<uint8_t>(AgriActAction::ACT_CLOSE);
+  uint8_t stop   = static_cast<uint8_t>(AgriActAction::STOP);
 
   // Handle pending actions after interlock
-  if (g_pendingAction != stop && now >= g_interlockUntilMs && g_currentAction == stop) {
+  if (g_pendingAction != stop &&
+      now >= g_interlockUntilMs &&
+      g_currentAction == stop) {
+
     // Start new move
     g_currentAction    = g_pendingAction;
     g_pendingAction    = stop;
     g_actuatorStartMs  = now;
     g_statusFlags |= STATUS_FLAG_MOVING;
-    // We are actively moving, so don't claim open/closed yet
-    g_statusFlags &= ~(STATUS_FLAG_OPEN | STATUS_FLAG_CLOSED | STATUS_FLAG_TIMEOUT);
     applyActuatorOutputs(g_currentAction);
   }
 
@@ -337,20 +338,11 @@ void updateActuatorState() {
   if (g_currentAction != stop) {
     uint32_t elapsed = now - g_actuatorStartMs;
 
-    // 1) Normal completion: runMs reached (without hitting safety limits)
+    // 1) Normal completion: runMs reached
     if (elapsed >= g_targetRunMs) {
       Serial.println(F("[UNO_NODE] Command runMs reached -> STOP (normal completion)"));
 
-      // Normal completion: no TIMEOUT/FAULT, just set final position.
-      g_statusFlags &= ~(STATUS_FLAG_MOVING | STATUS_FLAG_TIMEOUT | STATUS_FLAG_FAULT);
-
-      // Approximate final position based on direction.
-      g_statusFlags &= ~(STATUS_FLAG_OPEN | STATUS_FLAG_CLOSED);
-      if (g_currentAction == openA) {
-        g_statusFlags |= STATUS_FLAG_OPEN | STATUS_FLAG_ENDSTOP;
-      } else if (g_currentAction == closeA) {
-        g_statusFlags |= STATUS_FLAG_CLOSED | STATUS_FLAG_ENDSTOP;
-      }
+      g_statusFlags &= ~STATUS_FLAG_MOVING;
 
       applyActuatorOutputs(stop);
       g_currentAction    = stop;
@@ -361,9 +353,8 @@ void updateActuatorState() {
     // 2) Hard safety cap (absolute MAX_RUNTIME ceiling)
     if (elapsed >= MAX_RUNTIME_MS) {
       Serial.println(F("[UNO_NODE] MAX_RUNTIME reached -> STOP (timeout)"));
-      g_statusFlags |= STATUS_FLAG_TIMEOUT;
+      g_statusFlags |= STATUS_FLAG_FAULT;
       g_statusFlags &= ~STATUS_FLAG_MOVING;
-      // We do NOT change OPEN/CLOSED here – final position is unknown
       applyActuatorOutputs(stop);
       g_currentAction    = stop;
       g_actuatorStartMs  = 0;
@@ -374,9 +365,8 @@ void updateActuatorState() {
     uint16_t currentmA = readCurrentmA();
     if (currentmA > OVERCURRENT_THRESHOLD) {
       Serial.println(F("[UNO_NODE] OVERCURRENT -> STOP + FAULT"));
-      g_statusFlags |= STATUS_FLAG_OVERCURR | STATUS_FLAG_FAULT;
+      g_statusFlags |= STATUS_FLAG_FAULT;
       g_statusFlags &= ~STATUS_FLAG_MOVING;
-      // OPEN/CLOSED left as-is; we don't know if it reached an endstop
       applyActuatorOutputs(stop);
       g_currentAction    = stop;
       g_actuatorStartMs  = 0;
@@ -386,40 +376,27 @@ void updateActuatorState() {
 }
 
 // -----------------------------
-// SAFETY – COMMS TIMEOUT
+// SAFETY – COMMS TIMEOUT FAILSAFE
 // -----------------------------
 
 void checkSafetyConditions() {
   uint32_t now = millis();
 
-  // Only trigger timeout if we previously considered comms OK
-  if ((g_statusFlags & STATUS_FLAG_COMMS_OK) &&
-      (now - g_lastCommMs >= COMMS_TIMEOUT_MS)) {
+  // If we haven't seen *any* RF activity (RX or TX-ACK) for too long → failsafe CLOSE
+  if (now - g_lastCommMs >= COMMS_TIMEOUT_MS) {
+    Serial.println(F("[UNO_NODE] COMMS TIMEOUT -> failsafe CLOSE"));
+    g_lastCommMs = now;  // avoid spamming
 
-    performCommsTimeoutFailsafe();
-    // After failsafe, mark comms as bad and "arm" for when we see traffic again
-    g_statusFlags &= ~STATUS_FLAG_COMMS_OK;
+    uint8_t closeA = static_cast<uint8_t>(AgriActAction::CLOSE);
+    uint8_t stop   = static_cast<uint8_t>(AgriActAction::STOP);
+
+    // Only request if not already closing or pending
+    if (g_currentAction == stop &&
+        g_pendingAction == stop) {
+      g_targetRunMs = MAX_RUNTIME_MS;  // full stroke attempt
+      requestActuatorAction(closeA);
+    }
   }
-}
-
-void performCommsTimeoutFailsafe() {
-  Serial.println(F("[UNO_NODE] COMMS TIMEOUT -> failsafe CLOSE"));
-
-  uint8_t closeA = static_cast<uint8_t>(AgriActAction::ACT_CLOSE);
-  uint8_t stop   = static_cast<uint8_t>(AgriActAction::ACT_STOP);
-
-  // For failsafe close we want a full-stroke attempt.
-  g_targetRunMs = MAX_RUNTIME_MS;
-
-  // If already closing or stopped, just let state machine handle it.
-  if (g_currentAction == stop && g_pendingAction == stop) {
-    // Request a close move; state machine will enforce runtime limit
-    requestActuatorAction(closeA);
-  } else if (g_currentAction != stop) {
-    // Already moving; let runtime cutoff handle it.
-  }
-
-  g_statusFlags |= STATUS_FLAG_TIMEOUT;
 }
 
 // -----------------------------
@@ -458,23 +435,21 @@ uint16_t readBattmV() {
 // -----------------------------
 
 void sendUnoStatus() {
-  uint8_t destAddr[6];
-  agri_getClusterAddress(MY_CLUSTER_ID, destAddr);
-
-  struct __attribute__((packed)) {
+  struct {
     AgriPacketHeader hdr;
     AgriUnoStatus    status;
   } pkt;
 
-  agri_buildHeader(
-    pkt.hdr,
-    AgriMsgType::UNO_STATUS,
-    AgriRole::UNO_NODE,
-    AgriRole::ESP32_CLUSTER,
-    MY_NODE_ID,
-    MY_CLUSTER_ID
-  );
+  // Build header manually
+  pkt.hdr.magic   = AGRI_MAGIC_BYTE;
+  pkt.hdr.msgType = static_cast<uint8_t>(AgriMsgType::UNO_STATUS);
+  pkt.hdr.srcRole = static_cast<uint8_t>(AgriRole::UNO_NODE);
+  pkt.hdr.dstRole = static_cast<uint8_t>(AgriRole::ESP32_CLUSTER);
+  pkt.hdr.srcId   = MY_NODE_ID;
+  pkt.hdr.dstId   = MY_CLUSTER_ID;
+  pkt.hdr.seq     = ++g_seq;
 
+  // Fill status
   pkt.status.zoneLocalId = ZONE_LOCAL_ID;
   pkt.status.statusFlags = g_statusFlags;
   pkt.status.current_mA  = readCurrentmA();
@@ -483,16 +458,25 @@ void sendUnoStatus() {
   pkt.status.batt_mV     = readBattmV();
   pkt.status.lastCmdSeq  = g_lastCmdSeq;
 
-  AgriResult res = agri_rf24_sendTo(
-    radio,
-    destAddr,
-    &pkt,
-    sizeof(pkt)
-  );
+  uint8_t len = sizeof(pkt);
 
-  if (res != AgriResult::OK) {
+  Serial.print(F("[UNO_NODE] sendUnoStatus len="));
+  Serial.print(len);
+  Serial.print(F(" hdr="));
+  Serial.print(sizeof(AgriPacketHeader));
+  Serial.print(F(" status="));
+  Serial.println(sizeof(AgriUnoStatus));
+
+  // TX burst: stop listening, send, resume listening
+  radio.stopListening();
+  bool ok = radio.write(&pkt, len);
+  radio.startListening();
+
+  if (!ok) {
     Serial.println(F("[UNO_NODE] sendUnoStatus RF FAIL"));
   } else {
-    Serial.println(F("[UNO_NODE] sent status"));
+    // *** KEY FIX: successful TX counts as comms activity ***
+    g_lastCommMs = millis();
+    Serial.println(F("[UNO_NODE] sendUnoStatus OK"));
   }
 }
