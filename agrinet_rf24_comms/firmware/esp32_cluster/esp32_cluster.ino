@@ -8,12 +8,24 @@
 /**
  * ESP32 Cluster Node – RF24 RX + TX
  *
- * - Listens for UNO_STATUS from UNO on pipe "CL001"
- * - Sends UNO_CMD_ACTUATOR to UNO on pipe "UN001"
- * - Serial commands:
- *   'o' -> OPEN  5000 ms
- *   'c' -> CLOSE 5000 ms
- *   's' -> STOP  (runMs=0)
+ * - UNO actuator link:
+ *   * Listens for UNO_STATUS from UNO on pipe "CL001"
+ *   * Sends UNO_CMD_ACTUATOR to UNO on pipe "UN001"
+ *   * Serial commands:
+ *       'o' -> OPEN  5000 ms
+ *       'c' -> CLOSE 5000 ms
+ *       's' -> STOP  (runMs=0)
+ *
+ * - UNO_Q (MMC) link:
+ *   * Uses AgriMsgType::CLUSTER_* messages
+ *   * RX: CLUSTER_SET_SCHED from UNO_Q
+ *   * TX: CLUSTER_TELEMETRY to UNO_Q via agri_rf24_sendTo()
+ *
+ * COMMS HEARTBEATS:
+ * - UNO actuator online/offline remains based on UNO_STATUS only.
+ * - UNO_Q online/offline based on:
+ *     * Any RX from UNO_Q (cluster messages), OR
+ *     * Any successful TX to UNO_Q (agri_rf24_sendTo == OK).
  */
 
 // -----------------------------
@@ -23,19 +35,19 @@
 static const uint8_t PIN_RF24_CE  = 4;
 static const uint8_t PIN_RF24_CSN = 5;
 
-// RF24 addresses – must match UNO side
+// RF24 addresses – UNO actuator link (must match UNO side)
 static const byte ADDR_UP[6]   = "CL001";   // UNO -> ESP32 (status)
 static const byte ADDR_DOWN[6] = "UN001";   // ESP32 -> UNO (commands)
 
 RF24 radio(PIN_RF24_CE, PIN_RF24_CSN);
 
 // IDs
-static const uint8_t CLUSTER_ID   = 1;   // this ESP32 "cluster"
-static const uint8_t UNO_NODE_ID  = 1;   // target UNO node
+static const uint8_t CLUSTER_ID    = 1;  // this ESP32 "cluster"
+static const uint8_t UNO_NODE_ID   = 1;  // target UNO actuator node
 static const uint8_t ZONE_LOCAL_ID = 1;  // zone on that UNO
 
 // -----------------------------
-// LOCAL ZONE STATE
+// LOCAL ZONE STATE (UNO ACTUATOR)
 // -----------------------------
 
 struct LocalZoneState {
@@ -43,28 +55,51 @@ struct LocalZoneState {
   uint8_t  zoneState;      // 0=IDLE, 1=IRRIGATING, 2=FAULT (not used yet)
   uint8_t  soilPct;        // 0-100
   uint32_t lastRunStartMs; // not used yet
-  uint32_t lastSeenMs;     // last time we received any status
-  bool     online;         // derived from lastSeenMs
+  uint32_t lastSeenMs;     // last time we received any UNO status
+  bool     online;         // derived from UNO status only
 };
 
 static LocalZoneState g_zone1;
 
 static const uint32_t UNO_OFFLINE_TIMEOUT_MS = 30000;
 
-// Outgoing sequence for packets
-static uint16_t g_seq      = 0;
+// Outgoing sequence for packets to UNO
+static uint16_t g_seq    = 0;
 // Command sequence mirrored into UNO status lastCmdSeq
-static uint16_t g_cmdSeq   = 0;
+static uint16_t g_cmdSeq = 0;
+
+// -----------------------------
+// UNO_Q (MMC) COMMS STATE
+// -----------------------------
+
+// RF24 addresses for UNO_Q link (provided by agri_get* helpers)
+static uint8_t g_addrMaster[6];   // UNO_Q MMC address
+static uint8_t g_addrCluster[6];  // this cluster's address for UNO_Q to target
+
+// COMMS HEARTBEAT – updated on RX and TX-ACK with UNO_Q
+static uint32_t g_lastCommMs_unoQ     = 0;
+static bool     g_unoQOnline          = false;
+static const uint32_t UNOQ_TIMEOUT_MS = 60000UL;   // 60 s
 
 // -----------------------------
 // FORWARD DECLS
 // -----------------------------
 
-void handleRx();
+void handleRx();  // shared RX for UNO and UNO_Q
 void handleUnoStatus(const AgriPacketHeader &hdr,
                      const AgriUnoStatus &status);
+void handleClusterSchedule(const AgriPacketHeader &hdr,
+                           const AgriClusterSchedule &sched);
+
 void handleSerialCommands();
 void sendActuatorCommand(uint8_t action, uint32_t runMs);
+
+// Telemetry up to UNO_Q (stub, to be called when you have real telemetry)
+bool sendClusterTelemetryToMaster(const AgriClusterTelemetry &tel);
+
+// UNO_Q heartbeat helpers
+static inline void unoQHeartbeatRx();
+static inline void unoQHeartbeatTxAck();
 
 // -----------------------------
 // SETUP / LOOP
@@ -73,7 +108,7 @@ void sendActuatorCommand(uint8_t action, uint32_t runMs);
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.println(F("\n[ESP32_CLUSTER] Booting (FULL RF24 RX+TX)"));
+  Serial.println(F("\n[ESP32_CLUSTER] Booting (UNO + UNO_Q RF24)"));
 
   g_zone1.zoneId         = 1;
   g_zone1.zoneState      = 0;
@@ -81,6 +116,9 @@ void setup() {
   g_zone1.lastRunStartMs = 0;
   g_zone1.lastSeenMs     = 0;
   g_zone1.online         = false;
+
+  g_unoQOnline      = false;
+  g_lastCommMs_unoQ = millis();   // treat as "recent" at boot
 
   if (!radio.begin()) {
     Serial.println(F("[ESP32_CLUSTER] RF24 begin FAILED"));
@@ -96,36 +134,60 @@ void setup() {
   radio.enableDynamicPayloads();
   radio.setAutoAck(true);
 
-  // Uplink + downlink
-  radio.openReadingPipe(1, ADDR_UP);    // status from UNO
-  radio.openWritingPipe(ADDR_DOWN);     // commands to UNO
+  // Configure addresses for UNO_Q link from helpers
+  agri_getMasterAddress(g_addrMaster);
+  agri_getClusterAddress(CLUSTER_ID, g_addrCluster);
+  Serial.print(F("[ESP32_CLUSTER] g_addrCluster bytes = "));
+  for (int i = 0; i < 5; ++i) {
+    Serial.print("0x");
+    Serial.print(g_addrCluster[i], HEX);
+    Serial.print(" ");
+  }
+  Serial.println();
+
+  // UNO actuator uplink + downlink
+  radio.openReadingPipe(1, ADDR_UP);        // status from UNO
+  radio.openWritingPipe(ADDR_DOWN);         // commands to UNO
+
+  // UNO_Q link: extra reading pipe for this cluster's address
+  radio.openReadingPipe(2, g_addrCluster);  // schedules / control from UNO_Q
+
   radio.startListening();
 
-  Serial.println(F("[ESP32_CLUSTER] Listening on pipe \"CL001\""));
+  Serial.println(F("[ESP32_CLUSTER] Listening on pipe 1 for UNO \"CL001\""));
+  Serial.println(F("[ESP32_CLUSTER] Listening on pipe 2 for UNO_Q cluster address"));
   Serial.println(F("[ESP32_CLUSTER] Serial commands: o=open 5s, c=close 5s, s=stop"));
 }
 
 void loop() {
-  // RX: handle incoming status packets
+  // RX: handle incoming packets from UNO actuator and UNO_Q MMC
   handleRx();
 
-  // Serial: send actuator commands
+  // Serial: send actuator commands to UNO
   handleSerialCommands();
 
-  // Offline detection
   uint32_t now = millis();
+
+  // UNO actuator offline detection (unchanged semantics)
   if (g_zone1.online && (now - g_zone1.lastSeenMs > UNO_OFFLINE_TIMEOUT_MS)) {
     g_zone1.online = false;
     Serial.println(F("[ESP32_CLUSTER] UNO marked OFFLINE (no status)"));
   }
+
+  // UNO_Q MMC offline detection (combined RX/TX-ACK heartbeat)
+  if (g_unoQOnline && (now - g_lastCommMs_unoQ > UNOQ_TIMEOUT_MS)) {
+    g_unoQOnline = false;
+    Serial.println(F("[ESP32_CLUSTER] UNO_Q marked OFFLINE (no RX/TX-ACK)"));
+  }
 }
 
 // -----------------------------
-// RX HANDLER
+// RX HANDLER (UNO + UNO_Q)
 // -----------------------------
 
 void handleRx() {
-  while (radio.available()) {
+  uint8_t pipe;
+  while (radio.available(&pipe)) {
     uint8_t buffer[AGRI_RF24_PAYLOAD_MAX];
     uint8_t size = radio.getDynamicPayloadSize();
     if (size > sizeof(buffer)) {
@@ -134,7 +196,9 @@ void handleRx() {
     radio.read(buffer, size);
 
     Serial.print(F("[ESP32_CLUSTER] RX len="));
-    Serial.println(size);
+    Serial.print(size);
+    Serial.print(F(" on pipe "));
+    Serial.println(pipe);
 
     if (size < sizeof(AgriPacketHeader)) {
       Serial.println(F("[ESP32_CLUSTER] RX too short for header"));
@@ -153,37 +217,88 @@ void handleRx() {
     uint8_t  payloadLen = size - sizeof(AgriPacketHeader);
 
     AgriMsgType msgType = static_cast<AgriMsgType>(hdr->msgType);
+    AgriRole    srcRole = static_cast<AgriRole>(hdr->srcRole);
+    AgriRole    dstRole = static_cast<AgriRole>(hdr->dstRole);
 
-    if (msgType == AgriMsgType::UNO_STATUS) {
-      Serial.print(F("[ESP32_CLUSTER] payloadLen="));
-      Serial.print(payloadLen);
-      Serial.print(F(" expected="));
-      Serial.println(sizeof(AgriUnoStatus));
+    switch (msgType) {
+      case AgriMsgType::UNO_STATUS: {
+        Serial.print(F("[ESP32_CLUSTER] payloadLen="));
+        Serial.print(payloadLen);
+        Serial.print(F(" expected="));
+        Serial.println(sizeof(AgriUnoStatus));
 
-      if (payloadLen < sizeof(AgriUnoStatus)) {
-        Serial.println(F("[ESP32_CLUSTER] UNO_STATUS len too short"));
-        continue;
+        if (payloadLen < sizeof(AgriUnoStatus)) {
+          Serial.println(F("[ESP32_CLUSTER] UNO_STATUS len too short"));
+          break;
+        }
+        const AgriUnoStatus *st =
+          reinterpret_cast<const AgriUnoStatus*>(payload);
+        handleUnoStatus(*hdr, *st);
+        break;
       }
-      const AgriUnoStatus *st =
-        reinterpret_cast<const AgriUnoStatus*>(payload);
-      handleUnoStatus(*hdr, *st);
-    } else {
-      Serial.print(F("[ESP32_CLUSTER] Unknown msgType 0x"));
-      Serial.println(static_cast<uint8_t>(msgType), HEX);
+
+         case AgriMsgType::CLUSTER_SET_SCHED: {
+      // This should be sent by UNO_Q (MMC) to this cluster
+      Serial.print(F("[ESP32_CLUSTER] CLUSTER_SET_SCHED payloadLen="));
+      Serial.println(payloadLen);
+
+      // Need at least clusterId + schedSeq + numEntries
+      const uint8_t schedHeaderBytes = sizeof(uint8_t) + sizeof(uint16_t) + sizeof(uint8_t);
+      if (payloadLen < schedHeaderBytes) {
+        Serial.println(F("[ESP32_CLUSTER] CLUSTER_SET_SCHED too short for header"));
+        break;
+      }
+
+      const AgriClusterSchedule *sched =
+        reinterpret_cast<const AgriClusterSchedule*>(payload);
+
+      // Full bytes required for numEntries entries
+      uint8_t requiredBytes = schedHeaderBytes +
+                              (sched->numEntries * sizeof(AgriZoneSchedule));
+      if (sched->numEntries > AGRI_MAX_SCHEDULE_ENTRIES) {
+        Serial.println(F("[ESP32_CLUSTER] CLUSTER_SET_SCHED numEntries > max, clamping"));
+        requiredBytes = schedHeaderBytes +
+                        (AGRI_MAX_SCHEDULE_ENTRIES * sizeof(AgriZoneSchedule));
+      }
+
+      if (payloadLen < requiredBytes) {
+        Serial.println(F("[ESP32_CLUSTER] CLUSTER_SET_SCHED truncated payload"));
+        break;
+      }
+
+      // Heartbeat if it actually came from UNO_Q
+      if (srcRole == AgriRole::UNOQ_MMC && dstRole == AgriRole::ESP32_CLUSTER) {
+        unoQHeartbeatRx();
+      }
+
+      handleClusterSchedule(*hdr, *sched);
+      break;
+    }
+
+
+      default:
+        Serial.print(F("[ESP32_CLUSTER] Unknown msgType 0x"));
+        Serial.println(static_cast<uint8_t>(msgType), HEX);
+        break;
     }
   }
 }
 
 // -----------------------------
-// HANDLE UNO STATUS
+// HANDLE UNO STATUS (UNO ACTUATOR)
 // -----------------------------
 
 void handleUnoStatus(const AgriPacketHeader &hdr,
                      const AgriUnoStatus &status) {
   uint32_t now = millis();
   g_zone1.lastSeenMs = now;
-  g_zone1.online     = true;
-  g_zone1.soilPct    = status.soilPct;
+
+  if (!g_zone1.online) {
+    g_zone1.online = true;
+    Serial.println(F("[ESP32_CLUSTER] UNO marked ONLINE (status RX)"));
+  }
+
+  g_zone1.soilPct = status.soilPct;
 
   Serial.print(F("[ESP32_CLUSTER] UNO_STATUS srcId="));
   Serial.print(hdr.srcId);
@@ -202,7 +317,43 @@ void handleUnoStatus(const AgriPacketHeader &hdr,
 }
 
 // -----------------------------
-// SERIAL → ACTUATOR COMMANDS
+// HANDLE CLUSTER SCHEDULE FROM UNO_Q
+// -----------------------------
+
+void handleClusterSchedule(const AgriPacketHeader &hdr,
+                           const AgriClusterSchedule &sched) {
+  Serial.print(F("[ESP32_CLUSTER] SCHED from srcRole="));
+  Serial.print(hdr.srcRole);
+  Serial.print(F(" srcId="));
+  Serial.print(hdr.srcId);
+  Serial.print(F(" clusterId="));
+  Serial.print(sched.clusterId);
+  Serial.print(F(" schedSeq="));
+  Serial.print(sched.schedSeq);
+  Serial.print(F(" numEntries="));
+  Serial.println(sched.numEntries);
+
+  for (uint8_t i = 0; i < sched.numEntries && i < AGRI_MAX_SCHEDULE_ENTRIES; ++i) {
+    const AgriZoneSchedule &z = sched.entries[i];
+    Serial.print(F("  [entry "));
+    Serial.print(i);
+    Serial.print(F("] zone="));
+    Serial.print(z.zoneId);
+    Serial.print(F(" mode="));
+    Serial.print(z.mode);
+    Serial.print(F(" start="));
+    Serial.print(z.startEpoch_s);
+    Serial.print(F(" dur="));
+    Serial.print(z.duration_s);
+    Serial.print(F(" priority="));
+    Serial.println(z.priority);
+  }
+
+  // TODO: apply schedule to local zones / store in RAM
+}
+
+// -----------------------------
+// SERIAL → ACTUATOR COMMANDS (UNO ACTUATOR)
 // -----------------------------
 
 void handleSerialCommands() {
@@ -226,7 +377,7 @@ void handleSerialCommands() {
 }
 
 // -----------------------------
-// SEND ACTUATOR COMMAND
+// SEND ACTUATOR COMMAND TO UNO
 // -----------------------------
 
 void sendActuatorCommand(uint8_t action, uint32_t runMs) {
@@ -261,8 +412,9 @@ void sendActuatorCommand(uint8_t action, uint32_t runMs) {
   Serial.print(F(" cmdSeq="));
   Serial.println(pkt.cmd.cmdSeq);
 
-  // TX burst: stop listening, send, resume listening
+  // TX burst: ensure writing pipe is UNO address, send, resume listening
   radio.stopListening();
+  radio.openWritingPipe(ADDR_DOWN);  // keep UNO link correct even if UNO_Q changed the pipe
   bool ok = radio.write(&pkt, len);
   radio.startListening();
 
@@ -270,5 +422,78 @@ void sendActuatorCommand(uint8_t action, uint32_t runMs) {
     Serial.println(F("[ESP32_CLUSTER] sendActuatorCommand RF FAIL"));
   } else {
     Serial.println(F("[ESP32_CLUSTER] sendActuatorCommand OK"));
+  }
+}
+
+// -----------------------------
+// SEND CLUSTER TELEMETRY TO UNO_Q (MMC)
+// -----------------------------
+
+bool sendClusterTelemetryToMaster(const AgriClusterTelemetry &tel) {
+  // Build into a raw buffer to avoid packed-struct / reference issues.
+  uint8_t buf[AGRI_RF24_PAYLOAD_MAX];
+
+  const uint8_t headerSize   = sizeof(AgriPacketHeader);
+  const uint8_t payloadSize  = sizeof(AgriClusterTelemetry);
+  const uint8_t totalSize    = headerSize + payloadSize;
+
+  if (totalSize > AGRI_RF24_PAYLOAD_MAX) {
+    Serial.println(F("[ESP32_CLUSTER] CLUSTER_TELEMETRY too large for RF24 payload"));
+    return false;
+  }
+
+  AgriPacketHeader *hdr           = reinterpret_cast<AgriPacketHeader*>(buf);
+  AgriClusterTelemetry *payload   =
+    reinterpret_cast<AgriClusterTelemetry*>(buf + headerSize);
+
+  agri_buildHeader(
+    *hdr,
+    AgriMsgType::CLUSTER_TELEMETRY,
+    AgriRole::ESP32_CLUSTER,
+    AgriRole::UNOQ_MMC,
+    CLUSTER_ID,   // srcId
+    0             // dstId (MMC id)
+  );
+
+  // Plain struct copy into payload
+  *payload = tel;
+
+  AgriResult res = agri_rf24_sendTo(
+    radio,
+    g_addrMaster,
+    buf,
+    totalSize
+  );
+
+  if (res == AgriResult::OK) {
+    unoQHeartbeatTxAck();
+    Serial.println(F("[ESP32_CLUSTER] CLUSTER_TELEMETRY sent OK"));
+    return true;
+  } else {
+    Serial.print(F("[ESP32_CLUSTER] CLUSTER_TELEMETRY send FAIL res="));
+    Serial.println(static_cast<uint8_t>(res));
+    return false;
+  }
+}
+
+// -----------------------------
+// UNO_Q HEARTBEAT HELPERS
+// -----------------------------
+
+static inline void unoQHeartbeatRx() {
+  uint32_t now = millis();
+  g_lastCommMs_unoQ = now;
+  if (!g_unoQOnline) {
+    g_unoQOnline = true;
+    Serial.println(F("[ESP32_CLUSTER] UNO_Q marked ONLINE (RX)"));
+  }
+}
+
+static inline void unoQHeartbeatTxAck() {
+  uint32_t now = millis();
+  g_lastCommMs_unoQ = now;
+  if (!g_unoQOnline) {
+    g_unoQOnline = true;
+    Serial.println(F("[ESP32_CLUSTER] UNO_Q marked ONLINE (TX-ACK)"));
   }
 }
