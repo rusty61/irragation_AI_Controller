@@ -1,37 +1,64 @@
+ #include <Arduino.h>
 #include <SPI.h>
 #include <RF24.h>
 #include "agri_rf24_common.h"
 
-// -----------------------------
-// HW CONFIG - ADJUST
-// RF24 pins for Arduino UNO_Q (per README)
-// -----------------------------
+#include <Arduino_RouterBridge.h>
+#define CONSOLE Monitor
 
+// -----------------------------
+// HW CONFIG - UNO_Q RF24 pins
+// -----------------------------
 static const uint8_t PIN_RF24_CE  = 9;
 static const uint8_t PIN_RF24_CSN = 10;
 
 RF24 radio(PIN_RF24_CE, PIN_RF24_CSN);
 
-// Example: clusters we expect
-static const uint8_t CLUSTER_IDS[] = {1, 2};
-static const uint8_t NUM_CLUSTERS  = sizeof(CLUSTER_IDS) / sizeof(CLUSTER_IDS[0]);
+// -----------------------------
+// UNO_Q <-> ESP32 addresses (from helpers)
+// -----------------------------
+static uint8_t g_addrMaster[6];   // UNO_Q listens here (ESP32 sends telemetry to this)
+static uint8_t g_addrCluster[6];  // UNO_Q sends control to this (ESP32 listens on pipe 2)
+
+// -----------------------------
+// COMMS heartbeat (RX/TX-ACK)
+// -----------------------------
+static uint32_t g_lastCommMs_cluster = 0;
+static bool     g_clusterOnline      = false;
+static const uint32_t CLUSTER_TIMEOUT_MS = 60000UL;
+
+// -----------------------------
+// TEST TIMER
+// -----------------------------
+static const uint32_t SEND_CMD_EVERY_MS = 15000UL;
+
+// -----------------------------
+// SMALL CONTROL PAYLOAD (FITS NRF24)
+// -----------------------------
+// NOTE: Struct definition moved to agri_rf24_common.h
+
+static uint16_t g_cmdSeq = 0;
 
 // -----------------------------
 // FORWARD DECLS
 // -----------------------------
+static void handleRx();
+static void handleClusterTelemetry(const AgriPacketHeader &hdr, const AgriClusterTelemetry &tel);
 
-void handleClusterPackets();
-void onClusterTelemetry(const AgriClusterTelemetry &tel);
-void sendFakeSchedule(uint8_t clusterId);
+static bool sendFakeZoneCmd(uint8_t clusterId);
+
+static inline void clusterHeartbeatRx();
+static inline void clusterHeartbeatTxAck();
 
 // -----------------------------
 // SETUP / LOOP
 // -----------------------------
-
 void setup() {
-  Serial.begin(115200);
-  delay(1000);
-  Serial.println(F("\n[UNO_Q_MMC] Booting"));
+  CONSOLE.begin();
+  delay(300);
+
+  CONSOLE.println();
+  CONSOLE.println(F("[UNO_Q_MMC] Booting (Master/MMC)"));
 
   AgriResult res = agri_rf24_init_common(
     radio,
@@ -41,65 +68,99 @@ void setup() {
   );
 
   if (res != AgriResult::OK) {
-    Serial.println(F("[UNO_Q_MMC] RF24 init failed"));
+    CONSOLE.println(F("[UNO_Q_MMC] RF24 init FAILED"));
   } else {
-    Serial.println(F("[UNO_Q_MMC] RF24 init OK"));
+    CONSOLE.println(F("[UNO_Q_MMC] RF24 init OK"));
   }
 
-  // TODO: open additional pipes if you want per-cluster pipes rather than a single address
+  // FORCE SETTINGS TO MATCH ESP32 EXACTLY
+  radio.setChannel(76);
+  radio.setDataRate(RF24_250KBPS);
+  radio.setPALevel(RF24_PA_MAX);
+  radio.enableDynamicPayloads();
+  radio.setAutoAck(true);
+  radio.setRetries(5, 15);     // 15*250us = 4ms delay, 5 retries
+
+  // Addresses must match ESP32 expectations:
+  // ESP32 sends telemetry to Master address
+  // ESP32 receives MMC commands on Cluster address (pipe 2)
+  agri_getMasterAddress(g_addrMaster);
+  agri_getClusterAddress(1, g_addrCluster); // clusterId = 1 (match ESP32 CLUSTER_ID)
+
+  CONSOLE.print(F("[UNO_Q] Cluster Addr: "));
+  for(int i=0; i<5; i++) { CONSOLE.print(g_addrCluster[i], HEX); CONSOLE.print(" "); }
+  CONSOLE.println();
+
+  // Listen for ESP32->UNO_Q telemetry on Master address
+  radio.openReadingPipe(1, g_addrMaster);
+  radio.startListening();
+
+  CONSOLE.println(F("[UNO_Q_MMC] Listening on MASTER addr for telemetry (pipe 1)"));
+  CONSOLE.println(F("[UNO_Q_MMC] Will TX commands to cluster addr (pipe 2 on ESP32)"));
+
+  g_lastCommMs_cluster = millis();
+  g_clusterOnline      = false;
 }
 
 void loop() {
-  handleClusterPackets();
+  handleRx();
 
-  // Example: send a fake schedule periodically to cluster 1 for testing
-  static uint32_t lastSchedMs = 0;
+  static uint32_t lastCmdMs = 0;
   uint32_t now = millis();
-  if (now - lastSchedMs > 15000) {
-    sendFakeSchedule(1);
-    lastSchedMs = now;
+  if (now - lastCmdMs >= SEND_CMD_EVERY_MS) {
+    sendFakeZoneCmd(1);
+    lastCmdMs = now;
   }
 
-  // TODO: IPC with Linux side to forward telemetry / receive real schedules
+  if (g_clusterOnline && (now - g_lastCommMs_cluster > CLUSTER_TIMEOUT_MS)) {
+    g_clusterOnline = false;
+    CONSOLE.println(F("[UNO_Q_MMC] Cluster marked OFFLINE (no RX/TX-ACK)"));
+  }
 }
 
 // -----------------------------
-// RX HANDLING
+// RX HANDLING (ESP32 -> UNO_Q)
 // -----------------------------
-
-void handleClusterPackets() {
+static void handleRx() {
   while (radio.available()) {
-    uint8_t buffer[AGRI_RF24_PAYLOAD_MAX];
-    uint8_t size = radio.getDynamicPayloadSize();
-    radio.read(buffer, size);
+    uint8_t buf[AGRI_RF24_PAYLOAD_MAX];
+    uint8_t len = radio.getDynamicPayloadSize();
+    if (len > sizeof(buf)) len = sizeof(buf);
 
-    if (size < sizeof(AgriPacketHeader)) {
-      Serial.println(F("[UNO_Q_MMC] RX too short"));
+    radio.read(buf, len);
+
+    if (len < sizeof(AgriPacketHeader)) {
+      CONSOLE.println(F("[UNO_Q_MMC] RX too short"));
       continue;
     }
 
-    AgriPacketHeader *hdr = reinterpret_cast<AgriPacketHeader*>(buffer);
+    const AgriPacketHeader *hdr = reinterpret_cast<const AgriPacketHeader*>(buf);
     if (hdr->magic != AGRI_MAGIC_BYTE) {
-      Serial.println(F("[UNO_Q_MMC] BAD magic"));
+      CONSOLE.println(F("[UNO_Q_MMC] RX BAD magic"));
       continue;
     }
 
-    AgriMsgType msgType = static_cast<AgriMsgType>(hdr->msgType);
+    const uint8_t *payload = buf + sizeof(AgriPacketHeader);
+    const uint8_t payloadLen = len - sizeof(AgriPacketHeader);
+    const AgriMsgType msgType = static_cast<AgriMsgType>(hdr->msgType);
 
     switch (msgType) {
       case AgriMsgType::CLUSTER_TELEMETRY: {
-        if (size < sizeof(AgriPacketHeader) + sizeof(AgriClusterTelemetry)) {
-          Serial.println(F("[UNO_Q_MMC] Bad TELEMETRY len"));
+        if (payloadLen < sizeof(AgriClusterTelemetry)) {
+          CONSOLE.println(F("[UNO_Q_MMC] CLUSTER_TELEMETRY too short"));
           break;
         }
-        AgriClusterTelemetry *tel =
-          reinterpret_cast<AgriClusterTelemetry*>(buffer + sizeof(AgriPacketHeader));
-        onClusterTelemetry(*tel);
+        clusterHeartbeatRx();
+
+        const AgriClusterTelemetry *tel =
+          reinterpret_cast<const AgriClusterTelemetry*>(payload);
+        handleClusterTelemetry(*hdr, *tel);
         break;
       }
 
       default:
-        // TODO: handle STATUS/FAULT/HEARTBEAT etc.
+        CONSOLE.print(F("[UNO_Q_MMC] RX msgType=0x"));
+        CONSOLE.println(static_cast<uint8_t>(msgType), HEX);
         break;
     }
   }
@@ -108,66 +169,97 @@ void handleClusterPackets() {
 // -----------------------------
 // TELEMETRY HANDOFF
 // -----------------------------
-
-void onClusterTelemetry(const AgriClusterTelemetry &tel) {
-  Serial.print(F("[UNO_Q_MMC] Telemetry from cluster "));
-  Serial.print(tel.clusterId);
-  Serial.print(F(" batt="));
-  Serial.print(tel.batt_mV);
-  Serial.print(F(" panel="));
-  Serial.print(tel.panel_mV);
-  Serial.print(F(" pump="));
-  Serial.print(tel.pumpCurrent_mA);
-  Serial.print(F(" zones="));
-  Serial.println(tel.numZones);
-
-  // TODO: forward to Linux (QRB2210) over UART/SPI/etc
+static void handleClusterTelemetry(const AgriPacketHeader &hdr, const AgriClusterTelemetry &tel) {
+  CONSOLE.print(F("[UNO_Q_MMC] TELEMETRY from cluster "));
+  CONSOLE.print(tel.clusterId);
+  CONSOLE.print(F(" seq="));
+  CONSOLE.print(tel.seq);
+  CONSOLE.print(F(" batt="));
+  CONSOLE.print(tel.batt_mV);
+  CONSOLE.print(F(" panel="));
+  CONSOLE.print(tel.panel_mV);
+  CONSOLE.print(F(" pump="));
+  CONSOLE.print(tel.pumpCurrent_mA);
+  CONSOLE.print(F(" zones="));
+  CONSOLE.println(tel.numZones);
 }
 
 // -----------------------------
-// SCHEDULE TX (TEST STUB)
+// SEND SMALL CMD (UNO_Q -> ESP32) FITS NRF24
 // -----------------------------
+static bool sendFakeZoneCmd(uint8_t clusterId) {
+  // Packet: header + AgriClusterZoneCmd (tiny)
+  uint8_t buf[AGRI_RF24_PAYLOAD_MAX];
 
-void sendFakeSchedule(uint8_t clusterId) {
-  uint8_t destAddr[6];
-  agri_getClusterAddress(clusterId, destAddr);
+  const uint8_t headerSize  = sizeof(AgriPacketHeader);
+  const uint8_t payloadSize = sizeof(AgriClusterZoneCmd);
+  const uint8_t totalSize   = headerSize + payloadSize;
 
-  struct __attribute__((packed)) {
-    AgriPacketHeader     hdr;
-    AgriClusterSchedule  sched;
-  } pkt;
+  if (totalSize > AGRI_RF24_PAYLOAD_MAX) {
+    CONSOLE.println(F("[UNO_Q_MMC] ZoneCmd too large (should never happen)"));
+    return false;
+  }
 
+  // Build header in local then memcpy (avoid packed bind issues)
+  AgriPacketHeader hdr;
   agri_buildHeader(
-    pkt.hdr,
-    AgriMsgType::CLUSTER_SET_SCHED,
+    hdr,
+    AgriMsgType::CLUSTER_CMD_ZONE,
     AgriRole::UNOQ_MMC,
     AgriRole::ESP32_CLUSTER,
     0,           // MMC id
     clusterId
   );
 
-  pkt.sched.clusterId = clusterId;
-  pkt.sched.schedSeq  = pkt.hdr.seq;   // simple: tie seq to schedule version
-  pkt.sched.numEntries = 1;
+  memcpy(buf, &hdr, headerSize);
 
-  pkt.sched.entries[0].zoneId       = 1;
-  pkt.sched.entries[0].mode         = 1;         // AUTO
-  pkt.sched.entries[0].startEpoch_s = 0;         // relative / placeholder
-  pkt.sched.entries[0].duration_s   = 600;       // 10 mins
-  pkt.sched.entries[0].priority     = 0;
+  AgriClusterZoneCmd cmd;
+  cmd.clusterId   = clusterId;
+  cmd.zoneId      = 1;
+  cmd.mode        = 1;          // AUTO (test)
+  cmd.cmdSeq      = ++g_cmdSeq;
+  cmd.duration_s  = 600;        // 10 min
 
-  AgriResult res = agri_rf24_sendTo(
-    radio,
-    destAddr,
-    &pkt,
-    sizeof(pkt.hdr) + sizeof(AgriClusterSchedule)
-  );
+  memcpy(buf + headerSize, &cmd, payloadSize);
 
-  if (res != AgriResult::OK) {
-    Serial.println(F("[UNO_Q_MMC] sendFakeSchedule RF fail"));
+  radio.stopListening();
+  AgriResult res = agri_rf24_sendTo(radio, g_addrCluster, buf, totalSize);
+  radio.startListening();
+
+  if (res == AgriResult::OK) {
+    clusterHeartbeatTxAck();
+    CONSOLE.print(F("[UNO_Q_MMC] Sent CLUSTER_CMD_ZONE to cluster "));
+    CONSOLE.print(clusterId);
+    CONSOLE.print(F(" cmdSeq="));
+    CONSOLE.print(cmd.cmdSeq);
+    CONSOLE.print(F(" (len="));
+    CONSOLE.print(totalSize);
+    CONSOLE.println(F(")"));
+    return true;
   } else {
-    Serial.print(F("[UNO_Q_MMC] Sent fake schedule to cluster "));
-    Serial.println(clusterId);
+    CONSOLE.print(F("[UNO_Q_MMC] ZoneCmd TX FAIL res="));
+    CONSOLE.println(static_cast<uint8_t>(res));
+    return false;
   }
 }
 
+// -----------------------------
+// HEARTBEAT HELPERS (RX/TX-ACK)
+// -----------------------------
+static inline void clusterHeartbeatRx() {
+  uint32_t now = millis();
+  g_lastCommMs_cluster = now;
+  if (!g_clusterOnline) {
+    g_clusterOnline = true;
+    CONSOLE.println(F("[UNO_Q_MMC] Cluster marked ONLINE (RX)"));
+  }
+}
+
+static inline void clusterHeartbeatTxAck() {
+  uint32_t now = millis();
+  g_lastCommMs_cluster = now;
+  if (!g_clusterOnline) {
+    g_clusterOnline = true;
+    CONSOLE.println(F("[UNO_Q_MMC] Cluster marked ONLINE (TX-ACK)"));
+  }
+}
