@@ -1,3 +1,11 @@
+/*
+  The user provided this header context but as a library file, 
+  so I'm creating a 'mock' file locally to reference if needed 
+  during my thought process, or to persist it if the user asks me to 'fix' it.
+  
+  This file is: /agri_rf24_common.h
+*/
+
 #ifndef AGRI_RF24_COMMON_H
 #define AGRI_RF24_COMMON_H
 
@@ -141,6 +149,17 @@ struct AgriZoneSchedule {
   uint32_t  startEpoch_s;
   uint32_t  duration_s;
   uint8_t   priority;
+};
+
+// -------------------------------------------------------------
+// NEW STRUCT: Command from MMC (UNO_Q) -> Cluster (ESP32)
+// -------------------------------------------------------------
+struct __attribute__((packed)) AgriClusterZoneCmd {
+  uint8_t  clusterId;
+  uint8_t  zoneId;      // 1..N
+  uint8_t  mode;        // 0=OFF, 1=AUTO, 2=FORCE_ON, 3=FORCE_OFF
+  uint16_t cmdSeq;
+  uint32_t duration_s;
 };
 
 struct AgriClusterSchedule {
