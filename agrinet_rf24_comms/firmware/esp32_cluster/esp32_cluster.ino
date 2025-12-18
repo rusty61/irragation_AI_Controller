@@ -1,4 +1,5 @@
-// agrinet_rf24_comms/firmware/esp32_cluster_full/esp32_cluster_full.ino
+
+ // agrinet_rf24_comms/firmware/esp32_cluster_full/esp32_cluster_full.ino
 
 #include <Arduino.h>
 #include <SPI.h>
@@ -128,7 +129,7 @@ void setup() {
 
   // Match UNO RF24 settings
   radio.setChannel(76);
-  radio.setPALevel(RF24_PA_LOW);
+  radio.setPALevel(RF24_PA_MAX); // Boost power so ACKs reach UNO_Q
   radio.setDataRate(RF24_250KBPS);
   radio.setRetries(5, 15);
   radio.enableDynamicPayloads();
@@ -137,25 +138,23 @@ void setup() {
   // Configure addresses for UNO_Q link from helpers
   agri_getMasterAddress(g_addrMaster);
   agri_getClusterAddress(CLUSTER_ID, g_addrCluster);
-  Serial.print(F("[ESP32_CLUSTER] g_addrCluster bytes = "));
-  for (int i = 0; i < 5; ++i) {
-    Serial.print("0x");
-    Serial.print(g_addrCluster[i], HEX);
-    Serial.print(" ");
-  }
+
+  Serial.print(F("[ESP32] Cluster Addr: "));
+  for(int i=0; i<5; i++) { Serial.print(g_addrCluster[i], HEX); Serial.print(" "); }
   Serial.println();
 
   // UNO actuator uplink + downlink
   radio.openReadingPipe(1, ADDR_UP);        // status from UNO
   radio.openWritingPipe(ADDR_DOWN);         // commands to UNO
 
-  // UNO_Q link: extra reading pipe for this cluster's address
-  radio.openReadingPipe(2, g_addrCluster);  // schedules / control from UNO_Q
+  // UNO_Q link: Use Pipe 0 for full 5-byte address uniqueness
+  // (Pipes 2-5 must share prefix with Pipe 1, which we don't match)
+  radio.openReadingPipe(0, g_addrCluster);  
 
   radio.startListening();
 
   Serial.println(F("[ESP32_CLUSTER] Listening on pipe 1 for UNO \"CL001\""));
-  Serial.println(F("[ESP32_CLUSTER] Listening on pipe 2 for UNO_Q cluster address"));
+  Serial.println(F("[ESP32_CLUSTER] Listening on pipe 0 for UNO_Q cluster address"));
   Serial.println(F("[ESP32_CLUSTER] Serial commands: o=open 5s, c=close 5s, s=stop"));
 }
 
@@ -237,44 +236,75 @@ void handleRx() {
         break;
       }
 
-         case AgriMsgType::CLUSTER_SET_SCHED: {
-      // This should be sent by UNO_Q (MMC) to this cluster
-      Serial.print(F("[ESP32_CLUSTER] CLUSTER_SET_SCHED payloadLen="));
-      Serial.println(payloadLen);
+      case AgriMsgType::CLUSTER_SET_SCHED: {
+        // This should be sent by UNO_Q (MMC) to this cluster
+        Serial.print(F("[ESP32_CLUSTER] CLUSTER_SET_SCHED payloadLen="));
+        Serial.print(payloadLen);
+        Serial.print(F(" expected>="));
+        Serial.println(sizeof(AgriClusterSchedule));
 
-      // Need at least clusterId + schedSeq + numEntries
-      const uint8_t schedHeaderBytes = sizeof(uint8_t) + sizeof(uint16_t) + sizeof(uint8_t);
-      if (payloadLen < schedHeaderBytes) {
-        Serial.println(F("[ESP32_CLUSTER] CLUSTER_SET_SCHED too short for header"));
+        if (payloadLen < sizeof(AgriClusterSchedule)) {
+          Serial.println(F("[ESP32_CLUSTER] CLUSTER_SET_SCHED len too short"));
+          break;
+        }
+
+        // Heartbeat if it actually came from UNO_Q
+        if (srcRole == AgriRole::UNOQ_MMC && dstRole == AgriRole::ESP32_CLUSTER) {
+          unoQHeartbeatRx();
+        }
+
+        const AgriClusterSchedule *sched =
+          reinterpret_cast<const AgriClusterSchedule*>(payload);
+        handleClusterSchedule(*hdr, *sched);
         break;
       }
 
-      const AgriClusterSchedule *sched =
-        reinterpret_cast<const AgriClusterSchedule*>(payload);
+      // -----------------------------------------------------------------
+      // NEW: Handle Cluster Zone Command from MMC
+      // -----------------------------------------------------------------
+      case AgriMsgType::CLUSTER_CMD_ZONE: {
+        if (payloadLen < sizeof(AgriClusterZoneCmd)) {
+          Serial.println(F("[ESP32_CLUSTER] CLUSTER_CMD_ZONE too short"));
+          break;
+        }
 
-      // Full bytes required for numEntries entries
-      uint8_t requiredBytes = schedHeaderBytes +
-                              (sched->numEntries * sizeof(AgriZoneSchedule));
-      if (sched->numEntries > AGRI_MAX_SCHEDULE_ENTRIES) {
-        Serial.println(F("[ESP32_CLUSTER] CLUSTER_SET_SCHED numEntries > max, clamping"));
-        requiredBytes = schedHeaderBytes +
-                        (AGRI_MAX_SCHEDULE_ENTRIES * sizeof(AgriZoneSchedule));
-      }
+        // Heartbeat if it actually came from UNO_Q
+        if (srcRole == AgriRole::UNOQ_MMC) {
+          unoQHeartbeatRx();
+        }
 
-      if (payloadLen < requiredBytes) {
-        Serial.println(F("[ESP32_CLUSTER] CLUSTER_SET_SCHED truncated payload"));
+        const AgriClusterZoneCmd *cmd = reinterpret_cast<const AgriClusterZoneCmd*>(payload);
+        
+        Serial.print(F("[ESP32_CLUSTER] RX MMC CMD: Zone="));
+        Serial.print(cmd->zoneId);
+        Serial.print(F(" Mode="));
+        Serial.print(cmd->mode);
+        Serial.print(F(" Duration="));
+        Serial.println(cmd->duration_s);
+
+        // TRANSLATE TO ACTUATOR COMMAND (for Zone 1)
+        // MMC Mode: 0=OFF, 1=AUTO, 2=FORCE_ON, 3=FORCE_OFF
+        // Actuators: 1=OPEN, 2=CLOSE, 0=STOP
+        
+        uint8_t action = 0; // default stop
+        uint32_t runMs = 0;
+
+        if (cmd->mode == 1 || cmd->mode == 2) {
+          // AUTO or FORCE_ON -> OPEN
+          action = 1; // OPEN
+          runMs = cmd->duration_s * 1000UL;
+        } else if (cmd->mode == 0 || cmd->mode == 3) {
+          // OFF or FORCE_OFF -> CLOSE
+          action = 2; // CLOSE
+          runMs = 30000UL; // Default 30s close time
+        }
+
+        if (action != 0) {
+          Serial.println(F("   -> Forwarding to UNO Actuator..."));
+          sendActuatorCommand(action, runMs);
+        }
         break;
       }
-
-      // Heartbeat if it actually came from UNO_Q
-      if (srcRole == AgriRole::UNOQ_MMC && dstRole == AgriRole::ESP32_CLUSTER) {
-        unoQHeartbeatRx();
-      }
-
-      handleClusterSchedule(*hdr, *sched);
-      break;
-    }
-
 
       default:
         Serial.print(F("[ESP32_CLUSTER] Unknown msgType 0x"));
@@ -415,7 +445,20 @@ void sendActuatorCommand(uint8_t action, uint32_t runMs) {
   // TX burst: ensure writing pipe is UNO address, send, resume listening
   radio.stopListening();
   radio.openWritingPipe(ADDR_DOWN);  // keep UNO link correct even if UNO_Q changed the pipe
-  bool ok = radio.write(&pkt, len);
+  
+  bool ok = false;
+  // Simple software retry (5 attempts, slightly longer backoff)
+  for (int i=0; i<5; i++) {
+    if (radio.write(&pkt, len)) {
+      ok = true;
+      break;
+    }
+    delay(10); // 10ms backoff
+  }
+
+  // RESTORE Pipe 0 for UNO_Q (because openWritingPipe overwrites Pipe 0 RX addr)
+  radio.openReadingPipe(0, g_addrCluster);
+  
   radio.startListening();
 
   if (!ok) {
