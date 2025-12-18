@@ -149,6 +149,7 @@ struct AgriUnoActuatorCommand {
   uint8_t   action;         // STOP(0) / OPEN(1) / CLOSE(2)
   uint32_t  runMs;          // Runtime in milliseconds
   uint16_t  cmdSeq;         // Command sequence number
+
 };
 ```
 
@@ -267,7 +268,7 @@ enum class AgriResult : uint8_t {
 
 1. **Maximum Runtime Cutoff**: Actuator automatically stops after configured maximum runtime (default 30 seconds)
 2. **Direction Interlock**: Brief delay between direction changes prevents motor damage
-3. **Failsafe on Comms Loss**: Auto-closes valve if no communication for 60 seconds
+3. **Failsafe on Comms Loss**: Send Notification if no communication for 60 seconds
 4. **Overcurrent Protection**: Stops actuator if current exceeds threshold
 
 ### ESP32 Cluster Nodes
