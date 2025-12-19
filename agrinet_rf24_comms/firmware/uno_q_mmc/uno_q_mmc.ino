@@ -173,6 +173,12 @@ static void handleRx() {
              const AgriSensorsWx1 *wx = reinterpret_cast<const AgriSensorsWx1*>(buf);
              CONSOLE.print(F("  Solar: ")); CONSOLE.print(wx->solar_Wm2);
              CONSOLE.print(F(" W/m2 Lux: ")); CONSOLE.println(wx->light_lux);
+        } else if (fh->frameType == 2) { // SOIL
+             if (len < sizeof(AgriSensorsSoil)) break;
+             const AgriSensorsSoil *soil = reinterpret_cast<const AgriSensorsSoil*>(buf);
+             CONSOLE.print(F("  Soil Addr: ")); CONSOLE.print(soil->soilAddr);
+             CONSOLE.print(F(" VWC: ")); CONSOLE.print(soil->vwc_cP / 100.0);
+             CONSOLE.print(F("% Temp: ")); CONSOLE.println(soil->soilTemp_cC / 100.0);
         }
         break;
       }
