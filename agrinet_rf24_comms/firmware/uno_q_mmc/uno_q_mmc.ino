@@ -1,4 +1,5 @@
- #include <Arduino.h>
+
+#include <Arduino.h>
 #include <SPI.h>
 #include <RF24.h>
 #include "agri_rf24_common.h"
@@ -31,11 +32,6 @@ static const uint32_t CLUSTER_TIMEOUT_MS = 60000UL;
 // TEST TIMER
 // -----------------------------
 static const uint32_t SEND_CMD_EVERY_MS = 15000UL;
-
-// -----------------------------
-// SMALL CONTROL PAYLOAD (FITS NRF24)
-// -----------------------------
-// NOTE: Struct definition moved to agri_rf24_common.h
 
 static uint16_t g_cmdSeq = 0;
 
@@ -73,23 +69,11 @@ void setup() {
     CONSOLE.println(F("[UNO_Q_MMC] RF24 init OK"));
   }
 
-  // FORCE SETTINGS TO MATCH ESP32 EXACTLY
-  radio.setChannel(76);
-  radio.setDataRate(RF24_250KBPS);
-  radio.setPALevel(RF24_PA_MAX);
-  radio.enableDynamicPayloads();
-  radio.setAutoAck(true);
-  radio.setRetries(5, 15);     // 15*250us = 4ms delay, 5 retries
-
   // Addresses must match ESP32 expectations:
   // ESP32 sends telemetry to Master address
   // ESP32 receives MMC commands on Cluster address (pipe 2)
   agri_getMasterAddress(g_addrMaster);
   agri_getClusterAddress(1, g_addrCluster); // clusterId = 1 (match ESP32 CLUSTER_ID)
-
-  CONSOLE.print(F("[UNO_Q] Cluster Addr: "));
-  for(int i=0; i<5; i++) { CONSOLE.print(g_addrCluster[i], HEX); CONSOLE.print(" "); }
-  CONSOLE.println();
 
   // Listen for ESP32->UNO_Q telemetry on Master address
   radio.openReadingPipe(1, g_addrMaster);
@@ -158,9 +142,43 @@ static void handleRx() {
         break;
       }
 
+      case AgriMsgType::SENSORS_TELEMETRY: {
+        // AgriSensorsFrameHeader includes AgriPacketHeader 'h'.
+        // So we interpret from 'buf', NOT 'payload'.
+        if (len < sizeof(AgriSensorsFrameHeader)) {
+           CONSOLE.println(F("[UNO_Q_MMC] SENSORS_TELEMETRY too short"));
+           break;
+        }
+        
+        const AgriSensorsFrameHeader *fh = reinterpret_cast<const AgriSensorsFrameHeader*>(buf);
+        
+        CONSOLE.print(F("[UNO_Q_MMC] SENSOR HUB "));
+        CONSOLE.print(fh->hubId);
+        CONSOLE.print(F(" Frame "));
+        CONSOLE.print(fh->frameIndex);
+        CONSOLE.print(F("/"));
+        CONSOLE.println(fh->frameCount);
+
+        if (fh->frameType == 0) { // WX0
+             if (len < sizeof(AgriSensorsWx0)) break;
+             const AgriSensorsWx0 *wx = reinterpret_cast<const AgriSensorsWx0*>(buf);
+             CONSOLE.print(F("  Temp: ")); CONSOLE.print(wx->airTemp_cC / 100.0);
+             CONSOLE.print(F(" RH: "));    CONSOLE.print(wx->rh_cP / 100.0);
+             CONSOLE.print(F(" Press: ")); CONSOLE.print(wx->pressure_hPa10 / 10.0);
+             CONSOLE.print(F(" Wind: "));  CONSOLE.print(wx->wind_ms100 / 100.0);
+             CONSOLE.print(F("m/s Dir: ")); CONSOLE.print(wx->windDir_deg);
+             CONSOLE.print(F(" Rain: "));  CONSOLE.println(wx->rain_mm10 / 10.0);
+        } else if (fh->frameType == 1) { // WX1
+             if (len < sizeof(AgriSensorsWx1)) break;
+             const AgriSensorsWx1 *wx = reinterpret_cast<const AgriSensorsWx1*>(buf);
+             CONSOLE.print(F("  Solar: ")); CONSOLE.print(wx->solar_Wm2);
+             CONSOLE.print(F(" W/m2 Lux: ")); CONSOLE.println(wx->light_lux);
+        }
+        break;
+      }
+
       default:
-        CONSOLE.print(F("[UNO_Q_MMC] RX msgType=0x"));
-        CONSOLE.println(static_cast<uint8_t>(msgType), HEX);
+        // Ignore other types
         break;
     }
   }
